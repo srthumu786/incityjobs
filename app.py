@@ -136,65 +136,48 @@ try:
                 **What Happens Next?**
                 * Your corporate city footprint is locked into our global directory database.
                 * The candidate matching pool, secure video interview nodes, and deferred billing nodes activate on **November 10, 2026**.
-                * A launch activation message will be delivered directly to **
-
-
-{admin_email}** on launch morning.
+                * A launch activation message will be delivered directly to **{admin_email}** on launch morning.
                 ***
                 """
             )
-
-except Exception:
-    st.error("⚠️ **SYSTEM NOTICE: CODE MCJ-ERR-999**")
-
-# Gated Feature Simulation Blocks
-st.write("---")
-st.markdown("#### 🛠️ Gated Production Modules (Launches Nov 10)")
-col1, col2 = st.columns(2)
-with col1:
-    st.button("📹 Identity-Verified Video Room", disabled=True)
-with col2:
-    st.button("📄 Generate Secure Offer Letter Vault", disabled=True)
-
-# Mandatory LLC Compliance Footer Integration
-st.write("---")
-st.caption(f"© {datetime.now().year} MyCityJobs{region_meta['suffix'].lower()}. All Rights Reserved. MyCityJobs™ is a wholly owned product of Thumu Mercantile LLC.")
-    # ==============================================================================
-    # 🔍 SECTION 3: STEP 4 - DYNAMIC FILTER & TRACK SELECTION ENGINE
-    # ==============================================================================
-    st.write("---")
-    st.markdown("### 🔍 Step 4: Proximity Matching & Placement Track Customization")
-
-    # 🗺️ 1. Proximity Radius Lock Component
-    target_zip = st.text_input("Enter Operations Target Zip Code", placeholder="e.g., 35601")
-    search_radius = st.slider("Select Proximity Hiring Radius (Miles)", min_value=50, max_value=100, value=75)
-    
-    st.caption(f"📍 System Action: Matching candidates strictly within a {search_radius}-mile sandbox of Zip Code {target_zip}.")
-
-    # ⚡ 2. Free-Form Position Window
-    raw_position = st.text_input("What positions do you need to fill locally?", placeholder="e.g., CNC Machinist, Warehouse Operator")
-    position_needed = MyCityJobsDiagnostics.sanitize_input(raw_position)
-
-    # 🛠️ 3. The Two-Track Decision Toggle Switch
-    st.markdown("#### Choose Your Placement Framework Track")
-    track_selection = st.radio(
-        "Select Platform Mode:",
-        ["🛡️ Premium Protection Track (Full Arbitration & 14-Day Trial)", "⚡ Rapid Bypass Track (Low-Fee Connection, No Arbitration)"]
-    )
-
-    # 📊 4. Dynamic UI Layout Changes Based on Selected Track
-    if "Premium Protection" in track_selection:
-        st.success(
-            "💎 **PREMIUM TRACK ACTIVE**\n\n"
-            "* **Monetization Framework:** Fixed placement tiers ($300 / $750 / $1,500) bound to Day 15 verification.\n"
-            "* **Protections:** Full 14-day termination rules apply. Platform Dispute Arbitration Engine active if a split occurs."
-        )
-    else:
-        st.warning(
-            "⚡ **RAPID BYPASS TRACK ACTIVE**\n\n"
-            "* **Monetization Framework:** Charged a one-time, very low flat convenience fee instantly upon candidate connection.\n"
-            "* **Arbitration Policy:** Strict 'As-Is' hiring. The 14-day trial monitoring and dispute processing modules are completely disabled."
-        )
+            st.caption("🛠️ Gated Production Modules (Launches Nov 10)")
 
 except Exception as e:
     st.error(f"Execution Exception encountered: {e}")
+
+# ==============================================================================
+# 🔍 SECTION 3: STEP 4 - DYNAMIC FILTER & TRACK SELECTION ENGINE
+# ==============================================================================
+st.write("---")
+st.markdown("### 🔍 Step 4: Proximity Matching & Placement Track Customization")
+
+# 🗺️ 1. Proximity Radius Lock Component
+target_zip = st.text_input("Enter Operations Target Zip Code", placeholder="e.g., 35601")
+search_radius = st.slider("Select Proximity Hiring Radius (Miles)", min_value=50, max_value=100, value=75)
+
+st.caption(f"📍 System Action: Matching candidates strictly within a {search_radius}-mile sandbox of Zip Code {target_zip}.")
+
+# ⚡ 2. Free-Form Position Window
+raw_position = st.text_input("What positions do you need to fill locally?", placeholder="e.g., CNC Machinist, Warehouse Operator")
+position_needed = MyCityJobsDiagnostics.sanitize_input(raw_position)
+
+# 🛠️ 3. The Two-Track Decision Toggle Switch
+st.markdown("#### Choose Your Placement Framework Track")
+track_selection = st.radio(
+    "Select Platform Mode:",
+    ["🛡️ Premium Protection Track (Full Arbitration & 14-Day Trial)", "⚡ Rapid Bypass Track (Low-Fee Connection, No Arbitration)"]
+)
+
+# 📊 4. Dynamic UI Layout Changes Based on Selected Track
+if "Premium Protection" in track_selection:
+    st.success(
+        "💎 **PREMIUM TRACK ACTIVE**\n\n"
+        "* **Monetization Framework:** Fixed placement tiers ($300 / $750 / $1,500) bound to Day 15 verification.\n"
+        "* **Protections:** Full 14-day termination rules apply. Platform Dispute Arbitration Engine active if a split occurs."
+    )
+else:
+    st.warning(
+        "⚡ **RAPID BYPASS TRACK ACTIVE**\n\n"
+        "* **Monetization Framework:** Charged a one-time, very low flat convenience fee instantly upon candidate connection.\n"
+        "* **Arbitration Policy:** Strict 'As-Is' hiring. The 14-day trial monitoring and dispute processing modules are completely disabled."
+    )
