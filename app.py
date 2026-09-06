@@ -58,7 +58,17 @@ class MyCityJobsDiagnostics:
 # ==============================================================================
 # 🌍 SECTION 2: STREAMLIT USER INTERFACE & BETA LAYOUT
 # ==============================================================================
-st.set_page_config(page_title="MyCityJobs US & IN Beta Portal", page_icon="🌍", layout="centered")
+st.set_page_config(page_title="MyCityJobs US & IN Beta Portal", st.write("---")
+
+# 📢 THE CHALLENGE HOOK HEADER
+st.warning(
+    "💡 **PROOF OVER PROMISES**\n\n"
+    "**Do not take what we are saying for granted. Test us by clicking the employer "
+    "or employee portal below to see what our system gives.**"
+)
+
+st.write("---")
+"🌍", layout="centered")
 
 # Initialize Domain Alias Checking
 region_meta = MyCityJobsDiagnostics.detect_localization_context()
