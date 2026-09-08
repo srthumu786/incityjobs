@@ -2,6 +2,7 @@
 import streamlit as st
 import hashlib
 import re
+import psycopg2
 from datetime import datetime
 
 # ==============================================================================
@@ -10,6 +11,9 @@ from datetime import datetime
 class InCityJobsDiagnostics:
     """Anticipates, identifies, and outputs error codes with direct user solutions."""
     
+    # Secure connection pool directly routing to your live Neon cloud database instance
+    DB_URL = "postgresql://neondb_owner:npg_uP0AbeZscf7N@ep-billowing-cloud-aeks7m5w-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+
     @staticmethod
     def detect_localization_context():
         """Simulates reading the incoming domain alias to adjust regional metadata."""
@@ -55,6 +59,51 @@ class InCityJobsDiagnostics:
             }
             
         return {"code": "ICJ-OK-200", "title": "Passed Verification", "solution": "Success"}
+
+    @classmethod
+    def initialize_database_schema(cls):
+        """Creates the structural schema columns inside your cloud Neon database instance automatically."""
+        try:
+            conn = psycopg2.connect(cls.DB_URL)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS employers (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMP NOT NULL,
+                    company_name TEXT NOT NULL,
+                    corporate_hq TEXT NOT NULL,
+                    admin_email TEXT NOT NULL,
+                    admin_phone TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    security_token TEXT NOT NULL
+                );
+            """)
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            pass
+
+    @classmethod
+    def save_employer_to_cloud(cls, company, hq, email, phone, signature, token_hash):
+        """Saves corporate beta registrations permanently to your persistent database layer."""
+        try:
+            conn = psycopg2.connect(cls.DB_URL)
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO employers (timestamp, company_name, corporate_hq, admin_email, admin_phone, signature, security_token)
+                VALUES (%s, %s, %s, %s, %s, %s, %s);
+            """, (datetime.now(), company, hq, email, phone, signature, token_hash))
+            conn.commit()
+            cur.close()
+            conn.close()
+            return True
+        except Exception as e:
+            st.error(f"Cloud Database Connection Interrupted: {str(e)}")
+            return False
+
+# Trigger Neon cloud table construction checks on application launch
+InCityJobsDiagnostics.initialize_database_schema()
 # ==============================================================================
 # 🗂️ SECTION 2: STREAMLIT USER INTERFACE & SIDEBAR ROUTING NAVIGATION
 # ==============================================================================
@@ -73,7 +122,6 @@ prelaunch_message = (
     f"Our multi-state employer frameworks, mandatory identity video nodes, and "
     f"deferred 'Pay After 2 Weeks' placement locks unlock completely on **November 10, 2026**."
 )
-
 # ==============================================================================
 # 🏠 PAGE BLOCK 1: HOME PORTAL OVERVIEW (EXECUTIVE BRIEFING & PROOF HOOK)
 # ==============================================================================
@@ -123,8 +171,7 @@ if page_selection == "Home Portal":
     )
     
     st.markdown("---")
-    st.caption(f"© {datetime.now().year} InCityJobs{region_meta['suffix'].lower()}. All Rights Reserved. Product of Thumu Mercantile LLC.")
-# ==============================================================================
+    st.caption(f"© {datetime.n# ==============================================================================
 # 🏢 PAGE BLOCK 2: EMPLOYER PORTAL
 # ==============================================================================
 elif page_selection == "Employer Portal":
@@ -156,6 +203,7 @@ elif page_selection == "Employer Portal":
         raw_sign = st.text_input("Type Authorized Representative Full Name to Sign", placeholder="e.g., John C. Doe")
         
         submit_btn = st.form_submit_button("INITIALIZE BETA PROFILE", type="primary")
+
     if submit_btn:
         company_name = InCityJobsDiagnostics.sanitize_input(raw_company)
         corporate_hq = InCityJobsDiagnostics.sanitize_input(raw_hq)
@@ -174,29 +222,29 @@ elif page_selection == "Employer Portal":
             raw_token = f"{company_name}-{admin_email}-{sign_name}-CONSENT_TRUE"
             signature_hash = hashlib.sha256(raw_token.encode()).hexdigest()
             
-            try:
-                with open("beta_employers_db.txt", "a") as db_file:
-                    db_file.write(f"[{datetime.now()}] CO: {company_name} | HQ: {corporate_hq} | MAIL: {admin_email} | HASH: {signature_hash}\n")
-            except Exception as e:
-                st.error(f"Local Storage Write Interrupted: {str(e)}")
-            
-            st.balloons()
-            st.success("🎉 **BETA REGISTRATION COMPLETED SUCCESSFULLY!**")
-            st.markdown(
-                f"""
-                ---
-                ### 🔒 Your Account is Locked in Secure Travel Mode
-                * **Company Status:** Fully Verified & Logged Nationwide
-                * **Monetization Engine:** Deferred Settlement Active ('Pay After 2 Weeks')
-                * **Merchant Routing Network:** Vaulted through Thumu Mercantile LLC
-                * **Database Routing ID:** `ICJ-GLOBAL-{signature_hash[:8].upper()}`
-                * **Cryptographic Contract Seal:** `{signature_hash}`
-                
-                **What Happens Next?**
-                * Your corporate city footprint is locked into our directory database.
-                * Automated matching notifications will be routed directly to **{admin_email}**.
-                """
+            # Save the signup record permanently to the persistent cloud database vault
+            db_save_success = InCityJobsDiagnostics.save_employer_to_cloud(
+                company_name, corporate_hq, admin_email, admin_phone, sign_name, signature_hash
             )
+            
+            if db_save_success:
+                st.balloons()
+                st.success("🎉 **BETA REGISTRATION COMPLETED SUCCESSFULLY!**")
+                st.markdown(
+                    f"""
+                    ---
+                    ### 🔒 Your Account is Locked in Secure Travel Mode
+                    * **Company Status:** Fully Verified & Logged Nationwide
+                    * **Monetization Engine:** Deferred Settlement Active ('Pay After 2 Weeks')
+                    * **Merchant Routing Network:** Vaulted through Thumu Mercantile LLC
+                    * **Database Routing ID:** `ICJ-GLOBAL-{signature_hash[:8].upper()}`
+                    * **Cryptographic Contract Seal:** `{signature_hash}`
+                    
+                    **What Happens Next?**
+                    * Your corporate city footprint is locked securely inside your database tables.
+                    * Automated matching notifications will be routed directly to **{admin_email}**.
+                    """
+                )
 
 # ==============================================================================
 # 👥 PAGE BLOCK 3: EMPLOYEE PORTAL
@@ -205,4 +253,4 @@ elif page_selection == "Employee Portal":
     st.title("👥 Employee Access Portal")
     st.subheader(f"Localized Talent Onboarding Verification Node ({region_meta['region']})")
     st.info("Verification protocols and candidate profile match matrices will unlock completely on the national launch deployment date.")
-
+ow().year} InCityJobs{region_meta['suffix'].lower()}. All Rights Reserved. Product of Thumu Mercantile LLC.")
