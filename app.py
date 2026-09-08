@@ -58,7 +58,10 @@ class MyCityJobsDiagnostics:
 # ==============================================================================
 # 🌍 SECTION 2: STREAMLIT USER INTERFACE & BETA LAYOUT
 # ==============================================================================
-st.set_page_config(page_title="MyCityJobs US & IN Beta Portal", st.write("---")
+st.set_page_config(page_title="MyCityJobs US & IN Beta Portal", page_icon="🌍", layout="centered")
+
+st.write("---")
+le="MyCityJobs US & IN Beta Portal", st.write("---")
 
 # 📢 THE CHALLENGE HOOK HEADER
 st.warning(
@@ -191,3 +194,4 @@ else:
         "* **Monetization Framework:** Charged a one-time, very low flat convenience fee instantly upon candidate connection.\n"
         "* **Arbitration Policy:** Strict 'As-Is' hiring. The 14-day trial monitoring and dispute processing modules are completely disabled."
     )
+
