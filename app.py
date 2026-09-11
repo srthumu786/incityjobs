@@ -13,14 +13,22 @@ class InCityJobsDiagnostics:
     
     @staticmethod
     def get_secure_connection():
-        """Bypasses hardcoded strings by safely extracting keys from cloud settings."""
+        """Extracts the freshly reset password string directly from hidden environments."""
         try:
+            # 1. Primary check: Reads directly from Streamlit's secrets framework
             db_url = st.secrets["postgres"]["url"]
         except Exception:
             try:
+                # 2. Secondary check: Reads the repository configuration variable string
                 db_url = st.secrets["connection_string"]
             except Exception:
-                db_url = "postgresql://neondb_owner:npg_uP0AbeZscf7N@ep-billowing-cloud-aeks7m5w-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+                try:
+                    # 3. Alternative global check lookup parameter
+                    db_url = st.secrets["CONNECTION_STRING"]
+                except Exception as e:
+                    # Fallback notice providing diagnostic debug actions
+                    st.error("❌ CRITICAL: Secure connection parameters are missing. Please add the reset connection string to your Streamlit secrets control panel.")
+                    raise e
         return psycopg2.connect(db_url)
 
     @staticmethod
@@ -75,7 +83,6 @@ class InCityJobsDiagnostics:
         try:
             conn = cls.get_secure_connection()
             cur = conn.cursor()
-            # 🏢 Table 1: Employers
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS employers (
                     id SERIAL PRIMARY KEY,
@@ -88,7 +95,6 @@ class InCityJobsDiagnostics:
                     security_token TEXT NOT NULL
                 );
             """)
-            # 👥 Table 2: Employees (New Candidates Module!)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS candidates (
                     id SERIAL PRIMARY KEY,
@@ -129,12 +135,18 @@ class InCityJobsDiagnostics:
     def save_candidate_to_cloud(cls, name, role, email, phone, exp, token_hash):
         """Saves incoming talent acquisition records to your live PostgreSQL cloud vault."""
         try:
+            # Parse year numbers safely to validate column compatibility types
+            clean_exp_int = int(re.sub(r'\D', '', str(exp))) if str(exp).strip().isdigit() else 2
+        except Exception:
+            clean_exp_int = 2
+
+        try:
             conn = cls.get_secure_connection()
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO candidates (timestamp, full_name, target_role, contact_email, contact_phone, experience_years, verification_hash)
                 VALUES (%s, %s, %s, %s, %s, %s, %s);
-            """, (datetime.now(), name, role, email, phone, int(exp), token_hash))
+            """, (datetime.now(), name, role, email, phone, clean_exp_int, token_hash))
             conn.commit()
             cur.close()
             conn.close()
@@ -293,24 +305,23 @@ elif page_selection == "Employer Portal":
 elif page_selection == "Employee Portal":
     st.title("👥 Employee Access Portal")
     st.subheader(f"Localized Talent Onboarding Verification Node ({region_meta['region']})")
+    st.info("⚡ **BETA EXPERIENCE MATRIX ACTIVATED**\n\nCandidates can build their proximity matching records live below.")
     
-    st.info("⚡ **BETA EXPERIENCE MATRIX ACTIVATED**\n\nCandidates can now build their proximity matching records live below.")
+    st.markdown("### 🧑‍💼 Step 1: Professional Identification")
+    raw_name = st.text_input("Legal Full Name", placeholder="e.g., Jane Smith")
+    raw_role = st.text_input("Target Position / Core Skillset", placeholder="e.g., Full Stack Engineer")
     
-    with st.form("candidate_onboarding_form"):
-        st.markdown("### 🧑‍💼 Step 1: Professional Identification")
-        raw_name = st.text_input("Legal Full Name", placeholder="e.g., Jane Smith")
-        raw_role = st.text_input("Target Position / Core Skillset", placeholder="e.g., Full Stack Engineer / Logistics Specialist")
-        
-        st.markdown("### 📞 Step 2: Local Contact Touchpoints")
-        raw_email = st.text_input("Personal Contact Email Address", placeholder="jane.smith@example.com")
-        raw_phone = st.text_input("Mobile Direct Phone Number", placeholder="e.g., (256) 555-0144")
-        raw_exp = st.number_input("Years of Active Industry Experience", min_value=0, max_value=50, value=2, step=1)
-        
-        st.markdown("### 🔒 Step 3: Identity Integrity Certification")
-        st.warning("⚠️ By clicking submit, you verify you are locally resident inside this zone and agree to bypass zero evaluations off-platform.")
-        candidate_sign = st.text_input("Type Full Name to Certify Proximity Record", placeholder="e.g., Jane Smith")
-        
-        candidate_submit = st.form_submit_button("LOCK IN TALENT MATRIX PROFILE", type="primary")
+    st.markdown("### 📞 Step 2: Local Contact Touchpoints")
+    raw_email = st.text_input("Personal Contact Email Address", placeholder="jane.smith@example.com")
+    raw_phone = st.text_input("Mobile Direct Phone Number", placeholder="e.g., (256) 555-0144")
+    raw_exp = st.text_input("Years of Active Industry Experience", value="2")
+    
+    st.markdown("### 🔒 Step 3: Identity Integrity Certification")
+    st.warning("⚠️ By clicking below, you verify your local residency and execute a digital registration token.")
+    candidate_sign = st.text_input("Type Full Name to Certify Proximity Record", placeholder="e.g., Jane Smith")
+    
+    # Formless stable action trigger button execution
+    candidate_submit = st.button("LOCK IN TALENT MATRIX PROFILE", type="primary")
         
     if candidate_submit:
         clean_name = InCityJobsDiagnostics.sanitize_input(raw_name)
