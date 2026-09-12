@@ -216,75 +216,146 @@ if page_selection == "Home Portal":
 # 🏢 PAGE BLOCK 2: EMPLOYER PORTAL
 # ==============================================================================
 elif page_selection == "Employer Portal":
-    st.title("🏢 Employer Pre-Onboarding Node")
+    st.title("🏢 Employer Pre-Onboarding & Requisition Node")
     st.subheader(f"Secure Local Workforce Acquisition Matrix ({region_meta['region']})")
-    st.error(prelaunch_message)
     
-    st.write("---")
+    # Initialize a two-tab framework for sequential setup workflows
+    emp_tab1, emp_tab2 = st.tabs(["📋 Corporate Registration", "💼 Post a Job (Requisition Form)"])
     
-    with st.form("employer_registration_form"):
-        st.markdown("### 🏢 Step 1: Corporate Profile Registration")
-        raw_company = st.text_input("Legal Business / Company Name", placeholder="e.g., Apex Enterprise Logistics")
-        raw_hq = st.text_input("Corporate Headquarters Address (Billing/Primary Operations)", placeholder="e.g., 100 Main St, City, State")
-        raw_email = st.text_input("Primary Administrator Email Address", placeholder="hiring@yourcompany.com")
-        raw_phone = st.text_input("Local Direct Phone Number", placeholder="e.g., (256) 555-0199")
-
-        st.markdown("### 📜 Step 2: Platform Compliance & API Deferred Frameworks")
-        st.info(
-            f"**By registering for this Beta, you explicitly acknowledge and agree to the following financial frameworks:**\n\n"
-            f"1. **Placement Fee Tiers:** Placements are bound to fixed transaction tiers ($300 Tier 1, $750 Tier 2, $1,500 Tier 3) mapped to local currency equivalents ({region_meta['currency']}) payable ONLY upon successful placement fulfillment.\n"
-            f"2. **Deferred 14-Day Settlement:** Employers pay nothing upfront. The processing engine executes your fee allocation via Stripe ONLY after the candidate successfully completes their first 14 calendar days of active employment.\n"
-            f"3. **Pre-Authorization Escrow Lock:** Upon in-platform offer letter execution, a secure credit token is pre-authorized on your billing dashboard to guarantee settlement alignment on Day 15.\n"
-            f"4. **Anti-Fraud Identity & Video Gating:** All candidate evaluations must occur inside our secure video framework to cross-reference data records and completely eliminate offshore shadow-hiring scams."
-        )
-
-        agree_check = st.checkbox("I explicitly agree to the National Terms of Service, Anti-Bypassing, and Deferred 14-Day Settlement frameworks.")
-
-        st.markdown("### ✍️ Step 3: Secure Digital Execution")
-        raw_sign = st.text_input("Type Authorized Representative Full Name to Sign", placeholder="e.g., John C. Doe")
+    with emp_tab1:
+        st.error(prelaunch_message)
+        st.write("---")
         
-        submit_btn = st.form_submit_button("INITIALIZE BETA PROFILE", type="primary")
+        with st.form("employer_registration_form"):
+            st.markdown("### 🏢 Step 1: Corporate Profile Registration")
+            raw_company = st.text_input("Legal Business / Company Name", placeholder="e.g., Apex Enterprise Logistics")
+            raw_hq = st.text_input("Corporate Headquarters Address (Billing/Primary Operations)", placeholder="e.g., 100 Main St, City, State")
+            raw_email = st.text_input("Primary Administrator Email Address", placeholder="hiring@yourcompany.com")
+            raw_phone = st.text_input("Local Direct Phone Number", placeholder="e.g., (256) 555-0199")
 
-    if submit_btn:
-        company_name = InCityJobsDiagnostics.sanitize_input(raw_company)
-        corporate_hq = InCityJobsDiagnostics.sanitize_input(raw_hq)
-        admin_email = InCityJobsDiagnostics.sanitize_input(raw_email)
-        admin_phone = InCityJobsDiagnostics.sanitize_input(raw_phone)
-        sign_name = InCityJobsDiagnostics.sanitize_input(raw_sign)
-        
-        result = InCityJobsDiagnostics.validate_inputs(
-            company_name, corporate_hq, admin_email, admin_phone, sign_name, agree_check
-        )
-        
-        if result["code"] != "ICJ-OK-200":
-            st.warning(f"⚠️ **SYSTEM NOTICE: CODE {result['code']}**")
-            st.markdown(f"**Issue:** *{result['title']}*\n\n💡 **Solution:** {result['solution']}")
-        else:
-            raw_token = f"{company_name}-{admin_email}-{sign_name}-CONSENT_TRUE"
-            signature_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+            st.markdown("### 📜 Step 2: Platform Compliance & API Deferred Frameworks")
+            st.info(
+                f"**By registering for this Beta, you explicitly acknowledge and agree to the following financial frameworks:**\n\n"
+                f"1. **Placement Fee Tiers:** Placements are bound to fixed transaction tiers ($300 Tier 1, $750 Tier 2, $1,500 Tier 3) mapped to local currency equivalents ({region_meta['currency']}) payable ONLY upon successful placement fulfillment.\n"
+                f"2. **Deferred 14-Day Settlement:** Employers pay nothing upfront. The processing engine executes your fee allocation via Stripe ONLY after the candidate successfully completes their first 14 calendar days of active employment.\n"
+                f"3. **Pre-Authorization Escrow Lock:** Upon in-platform offer letter execution, a secure credit token is pre-authorized on your billing dashboard to guarantee settlement alignment on Day 15.\n"
+                f"4. **Anti-Fraud Identity & Video Gating:** All candidate evaluations must occur inside our secure video framework to cross-reference data records and completely eliminate offshore shadow-hiring scams."
+            )
+
+            agree_check = st.checkbox("I explicitly agree to the National Terms of Service, Anti-Bypassing, and Deferred 14-Day Settlement frameworks.")
+
+            st.markdown("### ✍️ Step 3: Secure Digital Execution")
+            raw_sign = st.text_input("Type Authorized Representative Full Name to Sign", placeholder="e.g., John C. Doe")
             
-            db_save_success = InCityJobsDiagnostics.save_employer_to_cloud(
-                company_name, corporate_hq, admin_email, admin_phone, sign_name, signature_hash
+            submit_btn = st.form_submit_button("INITIALIZE BETA PROFILE", type="primary")
+
+        if submit_btn:
+            company_name = InCityJobsDiagnostics.sanitize_input(raw_company)
+            corporate_hq = InCityJobsDiagnostics.sanitize_input(raw_hq)
+            admin_email = InCityJobsDiagnostics.sanitize_input(raw_email)
+            admin_phone = InCityJobsDiagnostics.sanitize_input(raw_phone)
+            sign_name = InCityJobsDiagnostics.sanitize_input(raw_sign)
+            
+            result = InCityJobsDiagnostics.validate_inputs(
+                company_name, corporate_hq, admin_email, admin_phone, sign_name, agree_check
             )
             
-            if db_save_success:
-                st.balloons()
-                st.success("🎉 **BETA REGISTRATION COMPLETED SUCCESSFULLY!**")
-                st.markdown(
-                    f"""
-                    ---
-                    ### 🔒 Your Account is Locked in Secure Travel Mode
-                    * **Company Status:** Fully Verified & Logged Nationwide
-                    * **Monetization Engine:** Deferred Settlement Active ('Pay After 2 Weeks')
-                    * **Merchant Routing Network:** Vaulted through Thumu Mercantile LLC
-                    * **Database Routing ID:** `ICJ-GLOBAL-{signature_hash[:8].upper()}`
-                    * **Cryptographic Contract Seal:** `{signature_hash}`
-                    
-                    **What Happens Next?**
-                    * Your corporate city footprint is locked securely inside your database tables.
-                    * Automated matching notifications will be routed directly to **{admin_email}**.
-                    """
+            if result["code"] != "ICJ-OK-200":
+                st.warning(f"⚠️ **SYSTEM NOTICE: CODE {result['code']}**")
+                st.markdown(f"**Issue:** *{result['title']}*\n\n💡 **Solution:** {result['solution']}")
+            else:
+                raw_token = f"{company_name}-{admin_email}-{sign_name}-CONSENT_TRUE"
+                signature_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+                
+                db_save_success = InCityJobsDiagnostics.save_employer_to_cloud(
+                    company_name, corporate_hq, admin_email, admin_phone, sign_name, signature_hash
                 )
+                
+                if db_save_success:
+                    st.balloons()
+                    st.success("🎉 **BETA REGISTRATION COMPLETED SUCCESSFULLY!**")
+                    st.markdown(
+                        f"""
+                        ---
+                        ### 🔒 Your Account is Locked in Secure Travel Mode
+                        * **Company Status:** Fully Verified & Logged Nationwide
+                        * **Monetization Engine:** Deferred Settlement Active ('Pay After 2 Weeks')
+                        * **Merchant Routing Network:** Vaulted through Thumu Mercantile LLC
+                        * **Database Routing ID:** `ICJ-GLOBAL-{signature_hash[:8].upper()}`
+                        * **Cryptographic Contract Seal:** `{signature_hash}`
+                        
+                        **What Happens Next?**
+                        * Your corporate city footprint is locked securely inside your database tables.
+                        * Automated matching notifications will be routed directly to **{admin_email}**.
+                        """
+                    )
+
+    with emp_tab2:
+        st.markdown("### 💼 Job Requisition & Footprint Ingestion Node")
+        st.caption("Phase 3: Step 3.2 — Permanent Cloud Database Schema Ingestion")
+        
+        with st.form("job_requisition_form"):
+            job_title = st.text_input("Job Position Title", placeholder="e.g., Heavy Equipment Operator")
+            department_metric = st.selectbox("Department Category Matrix", ["Logistics", "Manufacturing", "Technical Services", "Administrative", "Retail/Fulfillment"])
+            pricing_tier = st.radio("Placement Fee Pricing Tier Assignment", ["Tier 1 ($300 Fee Locked)", "Tier 2 ($750 Fee Locked)", "Tier 3 ($1,500 Fee Locked)"])
+            
+            st.markdown("#### 📍 Physical Worksite Proximity Parameters")
+            site_address = st.text_input("Worksite Street Address", placeholder="e.g., 450 Logistics Blvd")
+            site_city = st.text_input("Worksite City", placeholder="e.g., Austin")
+            site_state = st.text_input("Worksite State", placeholder="e.g., TX")
+            site_zip = st.text_input("Worksite Zip Code", placeholder="e.g., 78744")
+            
+            job_submit = st.form_submit_button("PUBLISH LIVE REQUISITION", type="primary")
+            
+        if job_submit:
+            if not job_title or not site_zip or not site_address:
+                st.error("❌ Operational criteria missing. Position Title, Worksite Address, and Zip Code are mandatory fields.")
+            else:
+                with st.spinner("Injecting job blueprint and parameters to Neon cluster..."):
+                    # Step 3.3 will handle live coordinate calculations; setting baseline fallbacks
+                    mock_site_lat, mock_site_lon = 30.2112, -97.7554
+                    
+                    try:
+                        db_url = "postgresql://neondb_owner:npg_MKul5P0djrzJ@ep-billowing-cloud-aeks7m5w-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+                        conn = psycopg2.connect(db_url)
+                        cursor = conn.cursor()
+                        
+                        # Generate structured job requisitions data table dynamically if missing
+                        cursor.execute("""
+                            CREATE TABLE IF NOT EXISTS employer_jobs (
+                                id SERIAL PRIMARY KEY,
+                                title VARCHAR(255),
+                                department VARCHAR(100),
+                                pricing_tier VARCHAR(100),
+                                address TEXT,
+                                latitude FLOAT,
+                                longitude FLOAT,
+                                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                            );
+                        """)
+                        
+                        # Inject clean structured query fields into the Neon cluster
+                        cursor.execute("""
+                            INSERT INTO employer_jobs (title, department, pricing_tier, address, latitude, longitude)
+                            VALUES (%s, %s, %s, %s, %s, %s);
+                        """, (job_title, department_metric, pricing_tier, f"{site_address}, {site_city}, {site_state} {site_zip}".strip(), mock_site_lat, mock_site_lon))
+                        
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
+                        
+                        st.success("🎉 **JOB REQUISITION SYSTEM DEPLOYED LIVE TO NEON CLUSTER!**")
+                        st.json({
+                            "requisition_title": job_title,
+                            "department": department_metric,
+                            "pricing": pricing_tier,
+                            "coordinates": [mock_site_lat, mock_site_lon],
+                            "status": "active_seeking_proximity_matches"
+                        })
+                        
+                    except Exception as e:
+                        st.error(f"❌ Database Synchronization Pipeline Failure: {str(e)}")
+
 # ==============================================================================
 # 👥 PAGE BLOCK 3: EMPLOYEE PORTAL
 # ==============================================================================
@@ -292,4 +363,3 @@ elif page_selection == "Employee Portal":
     st.title("👥 Employee Access Portal")
     st.subheader(f"Localized Talent Onboarding Verification Node ({region_meta['region']})")
     candidate_profile_ingestion_ui()
-
