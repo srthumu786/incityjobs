@@ -291,54 +291,5 @@ elif page_selection == "Employer Portal":
 elif page_selection == "Employee Portal":
     st.title("👥 Employee Access Portal")
     st.subheader(f"Localized Talent Onboarding Verification Node ({region_meta['region']})")
-    st.info("⚡ **BETA EXPERIENCE MATRIX ACTIVATED**\n\nCandidates can build their proximity matching records live below.")
-    
-    st.markdown("### 🧑‍💼 Step 1: Professional Identification")
-    raw_name = st.text_input("Legal Full Name", placeholder="e.g., Jane Smith")
-    raw_role = st.text_input("Target Position / Core Skillset", placeholder="e.g., Full Stack Engineer")
-    
-    st.markdown("### 📞 Step 2: Local Contact Touchpoints")
-    raw_email = st.text_input("Personal Contact Email Address", placeholder="jane.smith@example.com")
-    raw_phone = st.text_input("Mobile Direct Phone Number", placeholder="e.g., (256) 555-0144")
-    raw_exp = st.text_input("Years of Active Industry Experience", value="2")
-    
-    st.markdown("### 🔒 Step 3: Identity Integrity Certification")
-    st.warning("⚠️ By clicking below, you verify your local residency and execute a digital registration token.")
-    candidate_sign = st.text_input("Type Full Name to Certify Proximity Record", placeholder="e.g., Jane Smith")
-    
-    # Formless stable action trigger button execution
-    candidate_submit = st.button("LOCK IN TALENT MATRIX PROFILE", type="primary")
-        
-    if candidate_submit:
-        clean_name = InCityJobsDiagnostics.sanitize_input(raw_name)
-        clean_role = InCityJobsDiagnostics.sanitize_input(raw_role)
-        clean_email = InCityJobsDiagnostics.sanitize_input(raw_email)
-        clean_phone = InCityJobsDiagnostics.sanitize_input(raw_phone)
-        clean_sign = InCityJobsDiagnostics.sanitize_input(candidate_sign)
-        
-        if not (clean_name and clean_role and clean_email and clean_phone and clean_sign):
-            st.error("❌ **REGISTRATION FAULT: All candidate credential fields are mandatory.**")
-        else:
-            cand_token = f"{clean_name}-{clean_email}-{clean_role}-TALENT_VERIFIED"
-            cand_hash = hashlib.sha256(cand_token.encode()).hexdigest()
-            
-            # Save candidate record permanently to Neon Postgres database
-            save_status = InCityJobsDiagnostics.save_candidate_to_cloud(
-                clean_name, clean_role, clean_email, clean_phone, raw_exp, cand_hash
-            )
-            
-            if save_status:
-                st.balloons()
-                st.success("🎉 **CANDIDATE ONBOARDING PROFILE VERIFIED SUCCESSFULLY!**")
-                st.markdown(
-                    f"""
-                    ---
-                    ### 🔒 Proximity Pipeline Secured
-                    * **Talent Matching Radials:** Active & Scanning Local Zones
-                    * **System Routing Profile ID:** `ICJ-TALENT-{cand_hash[:8].upper()}`
-                    * **Secure Audit Signature Seal:** `{cand_hash}`
-                    
-                    *Our automated match notifications will execute directly to **{clean_email}** as target corporate spots unlock.*
-                    """
-                )
+    candidate_profile_ingestion_ui()
 
