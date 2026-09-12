@@ -312,7 +312,6 @@ elif page_selection == "Employer Portal":
                 st.error("❌ Operational criteria missing. Position Title, Worksite Address, and Zip Code are mandatory fields.")
             else:
                 with st.spinner("Injecting job blueprint and parameters to Neon cluster..."):
-                    # Step 3.3 will handle live coordinate calculations; setting baseline fallbacks
                     mock_site_lat, mock_site_lon = 30.2112, -97.7554
                     
                     try:
@@ -320,7 +319,6 @@ elif page_selection == "Employer Portal":
                         conn = psycopg2.connect(db_url)
                         cursor = conn.cursor()
                         
-                        # Generate structured job requisitions data table dynamically if missing
                         cursor.execute("""
                             CREATE TABLE IF NOT EXISTS employer_jobs (
                                 id SERIAL PRIMARY KEY,
@@ -334,7 +332,6 @@ elif page_selection == "Employer Portal":
                             );
                         """)
                         
-                        # Inject clean structured query fields into the Neon cluster
                         cursor.execute("""
                             INSERT INTO employer_jobs (title, department, pricing_tier, address, latitude, longitude)
                             VALUES (%s, %s, %s, %s, %s, %s);
