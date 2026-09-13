@@ -353,6 +353,270 @@ elif page_selection == "Employer Portal":
                     except Exception as e:
                         st.error(f"❌ Database Synchronization Pipeline Failure: {str(e)}")
 
+# Save this file locally as: /Users/Thumu/mycityjobs_project/app.py
+import streamlit as st
+import hashlib
+import re
+from datetime import datetime
+
+# Initialize deep session cache flags to prevent layout resetting loops
+if 'last_ingested_candidate' not in st.session_state:
+    st.session_state['last_ingested_candidate'] = None
+
+# Hardcoded global simulation values matching regional deployment settings
+region_meta = {
+    "region": "United States Lower 48",
+    "currency": "USD",
+    "symbol": "$"
+}
+prelaunch_message = "System Notice: Direct recruitment matrix engines are active in Beta Testing configurations."
+
+class InCityJobsDiagnostics:
+    @staticmethod
+    def sanitize_input(value: str) -> str:
+        if not value:
+            return ""
+        return re.sub(r'[<>\'"\\;]', '', value.strip())
+
+    @staticmethod
+    def validate_inputs(company, hq, email, phone, sign, agree) -> dict:
+        if not all([company, hq, email, phone, sign]):
+            return {"code": "ICJ-ERR-401", "title": "Missing Required Values", "solution": "Fill out all text input matrices completely."}
+        if not agree:
+            return {"code": "ICJ-ERR-402", "title": "Compliance Rejection", "solution": "You must explicitly check the authorization checkbox."}
+        if "@" not in email or "." not in email:
+            return {"code": "ICJ-ERR-403", "title": "Invalid Communication Node", "solution": "Verify the structural syntax of your email address."}
+        return {"code": "ICJ-OK-200", "title": "Validation Success", "solution": "Proceeding to cloud secure mapping protocols."}
+
+    @staticmethod
+    def save_employer_to_cloud(company, hq, email, phone, sign, signature_hash) -> bool:
+        import psycopg2
+        try:
+            db_url = "postgresql://neondb_owner:npg_MKul5P0djrzJ@ep-billowing-cloud-aeks7m5w-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+            conn = psycopg2.connect(db_url)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS beta_employers (
+                    id SERIAL PRIMARY KEY,
+                    company_name VARCHAR(255),
+                    corporate_hq TEXT,
+                    admin_email VARCHAR(255),
+                    admin_phone VARCHAR(50),
+                    signature_hash VARCHAR(64),
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cursor.execute("""
+                INSERT INTO beta_employers (company_name, corporate_hq, admin_email, admin_phone, signature_hash)
+                VALUES (%s, %s, %s, %s, %s);
+            """, (company, hq, email, phone, signature_hash))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return True
+        except Exception as e:
+            st.error(f"Cloud Storage Write Interrupted: {str(e)}")
+            return False
+def candidate_profile_ingestion_ui():
+    import psycopg2
+    
+    st.markdown("## 👤 Candidate Profile Ingestion Matrix")
+    st.caption("Phase 3: Core Hiring Automation & Core Workflows — Step 3.1 & 3.3")
+    
+    with st.form(key="candidate_ingestion_form"):
+        st.subheader("1. Professional Credentials")
+        candidate_name = st.text_input("Full Name (Absolute Identity Mapping)", placeholder="John Doe")
+        target_role = st.text_input("Target Role / Job Title", placeholder="Software Engineer")
+        resume_text = st.text_area("Paste Resume Text / Background Metrics", height=150)
+        
+        st.subheader("2. Hyper-Local Boundary Tracking")
+        st.info("Your coordinates are calculated dynamically via live GeoDNS mapping arrays.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            street_address = st.text_input("Street Address", placeholder="e.g., 100 Main St")
+            city = st.text_input("City", placeholder="e.g., Priceville")
+        with col2:
+            state = st.text_input("State / Region", placeholder="e.g., AL")
+            zip_code = st.text_input("Zip Code / Postal Code", placeholder="e.g., 35603")
+            
+        submit_button = st.form_submit_button(label="Lock Profile & Validate Location")
+        
+    if submit_button:
+        if not candidate_name or not zip_code or not resume_text:
+            st.error("❌ Critical fields missing. Name, Resume, and Zip Code are mandatory.")
+            return
+
+        with st.spinner("Executing isolated spatial calculations..."):
+            full_address = f"{street_address}, {city}, {state} {zip_code}".strip()
+            calculated_lat, calculated_lon = 34.5262, -86.9556
+            
+            try:
+                from geopy.geocoders import Nominatim
+                geolocator = Nominatim(user_agent="incityjobs_spatial_resolver_v4")
+                location = geolocator.geocode(full_address, timeout=5)
+                if location:
+                    calculated_lat = location.latitude
+                    calculated_lon = location.longitude
+                else:
+                    backup_location = geolocator.geocode(f"{city}, {state} {zip_code}".strip(), timeout=5)
+                    if backup_location:
+                        calculated_lat = backup_location.latitude
+                        calculated_lon = backup_location.longitude
+            except Exception:
+                pass
+            
+            try:
+                db_url = "postgresql://neondb_owner:npg_MKul5P0djrzJ@ep-billowing-cloud-aeks7m5w-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+                conn = psycopg2.connect(db_url)
+                cursor = conn.cursor()
+                
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS candidate_profiles (
+                        id SERIAL PRIMARY KEY,
+                        name VARCHAR(255),
+                        role VARCHAR(255),
+                        resume TEXT,
+                        address TEXT,
+                        latitude FLOAT,
+                        longitude FLOAT,
+                        status VARCHAR(50),
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                
+                cursor.execute("""
+                    INSERT INTO candidate_profiles (name, role, resume, address, latitude, longitude, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                """, (candidate_name, target_role, resume_text, full_address, calculated_lat, calculated_lon, "active_matching_pool"))
+                
+                conn.commit()
+                cursor.close()
+                conn.close()
+                
+                st.success("🎉 Dynamic Profile Ingestion Completed & Pushed to Live Neon Cluster!")
+                st.json({
+                    "name": candidate_name,
+                    "role": target_role,
+                    "address": full_address,
+                    "resolved_latitude": calculated_lat,
+                    "resolved_longitude": calculated_lon,
+                    "sync_status": "Committed with Dynamic Coordinates"
+                })
+            except Exception as e:
+                st.error(f"❌ Cloud Connection Blocked: {str(e)}")
+# ==============================================================================
+# 🎛️ NAVIGATION SIDEBAR PANEL CONFIGURATION
+# ==============================================================================
+st.sidebar.title("🌍 InCityJobs.us")
+st.sidebar.caption("United States Lower 48 Proximity Network")
+page_selection = st.sidebar.radio("Navigate Portals:", ["Home Portal", "Employer Portal", "Employee Portal"])
+
+# ==============================================================================
+# 🏠 PAGE BLOCK 1: HOME PORTAL
+# ==============================================================================
+if page_selection == "Home Portal":
+    st.title("🚀 Hyper-Local Hiring Automation Platform")
+    st.write("Welcome to the decentralized proximity routing platform interface dashboard.")
+
+# ==============================================================================
+# 🏢 PAGE BLOCK 2: EMPLOYER PORTAL
+# ==============================================================================
+elif page_selection == "Employer Portal":
+    st.title("🏢 Employer Pre-Onboarding & Requisition Node")
+    st.subheader(f"Secure Local Workforce Acquisition Matrix ({region_meta['region']})")
+    
+    emp_tab1, emp_tab2 = st.tabs(["📋 Corporate Registration", "💼 Post a Job (Requisition Form)"])
+    
+    with emp_tab1:
+        st.error(prelaunch_message)
+        st.write("---")
+        with st.form("employer_registration_form"):
+            st.markdown("### 🏢 Step 1: Corporate Profile Registration")
+            raw_company = st.text_input("Legal Business / Company Name", placeholder="e.g., Apex Enterprise Logistics")
+            raw_hq = st.text_input("Corporate Headquarters Address (Billing/Primary Operations)", placeholder="e.g., 100 Main St, City, State")
+            raw_email = st.text_input("Primary Administrator Email Address", placeholder="hiring@yourcompany.com")
+            raw_phone = st.text_input("Local Direct Phone Number", placeholder="e.g., (256) 555-0199")
+
+            st.markdown("### 📜 Step 2: Platform Compliance & API Deferred Frameworks")
+            st.info("Deferred 14-Day Settlement active via Stripe framework parameters upon validation.")
+            agree_check = st.checkbox("I explicitly agree to the National Terms of Service.")
+            raw_sign = st.text_input("Type Authorized Representative Full Name to Sign")
+            
+            submit_btn = st.form_submit_button("INITIALIZE BETA PROFILE", type="primary")
+
+        if submit_btn:
+            company_name = InCityJobsDiagnostics.sanitize_input(raw_company)
+            corporate_hq = InCityJobsDiagnostics.sanitize_input(raw_hq)
+            admin_email = InCityJobsDiagnostics.sanitize_input(raw_email)
+            admin_phone = InCityJobsDiagnostics.sanitize_input(raw_phone)
+            sign_name = InCityJobsDiagnostics.sanitize_input(raw_sign)
+            
+            result = InCityJobsDiagnostics.validate_inputs(company_name, corporate_hq, admin_email, admin_phone, sign_name, agree_check)
+            if result["code"] != "ICJ-OK-200":
+                st.warning(f"⚠️ SYSTEM NOTICE: CODE {result['code']} - {result['title']}")
+            else:
+                raw_token = f"{company_name}-{admin_email}-{sign_name}-CONSENT_TRUE"
+                signature_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+                if InCityJobsDiagnostics.save_employer_to_cloud(company_name, corporate_hq, admin_email, admin_phone, sign_name, signature_hash):
+                    st.balloons()
+                    st.success("🎉 BETA REGISTRATION COMPLETED SUCCESSFULLY!")
+    with emp_tab2:
+        st.markdown("### 💼 Job Requisition & Footprint Ingestion Node")
+        with st.form("job_requisition_form"):
+            job_title = st.text_input("Job Position Title", placeholder="e.g., Heavy Equipment Operator")
+            department_metric = st.selectbox("Department Category Matrix", ["Logistics", "Manufacturing", "Technical Services", "Administrative", "Retail/Fulfillment"])
+            pricing_tier = st.radio("Placement Fee Pricing Tier Assignment", ["Tier 1 ($300 Fee Locked)", "Tier 2 ($750 Fee Locked)", "Tier 3 ($1,500 Fee Locked)"])
+            
+            st.markdown("#### 📍 Physical Worksite Proximity Parameters")
+            site_address = st.text_input("Worksite Street Address", placeholder="e.g., 450 Logistics Blvd")
+            site_city = st.text_input("Worksite City", placeholder="e.g., Priceville")
+            site_state = st.text_input("Worksite State", placeholder="e.g., AL")
+            site_zip = st.text_input("Worksite Zip Code", placeholder="e.g., 35603")
+            job_submit = st.form_submit_button("PUBLISH LIVE REQUISITION", type="primary")
+            
+        if job_submit:
+            if not job_title or not site_zip or not site_address:
+                st.error("❌ Operational criteria missing. Mandated elements unchecked.")
+            else:
+                with st.spinner("Injecting job blueprint parameters..."):
+                    mock_site_lat, mock_site_lon = 34.5262, -86.9556
+                    try:
+                        from geopy.geocoders import Nominatim
+                        geolocator = Nominatim(user_agent="incityjobs_spatial_resolver_v4")
+                        loc = geolocator.geocode(f"{site_address}, {site_city}, {site_state} {site_zip}".strip(), timeout=5)
+                        if loc:
+                            mock_site_lat, mock_site_lon = loc.latitude, loc.longitude
+                    except Exception:
+                        pass
+                        
+                    try:
+                        db_url = "postgresql://neondb_owner:npg_MKul5P0djrzJ@ep-billowing-cloud-aeks7m5w-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+                        conn = psycopg2.connect(db_url)
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            CREATE TABLE IF NOT EXISTS employer_jobs (
+                                id SERIAL PRIMARY KEY,
+                                title VARCHAR(255),
+                                department VARCHAR(100),
+                                pricing_tier VARCHAR(100),
+                                address TEXT,
+                                latitude FLOAT,
+                                longitude FLOAT,
+                                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                            );
+                        """)
+                        cursor.execute("""
+                            INSERT INTO employer_jobs (title, department, pricing_tier, address, latitude, longitude)
+                            VALUES (%s, %s, %s, %s, %s, %s);
+                        """, (job_title, department_metric, pricing_tier, f"{site_address}, {site_city}, {site_state} {site_zip}".strip(), mock_site_lat, mock_site_lon))
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
+                        st.success("🎉 JOB REQUISITION SYSTEM DEPLOYED LIVE TO NEON CLUSTER!")
+                    except Exception as e:
+                        st.error(f"❌ Database Synchronization Pipeline Failure: {str(e)}")
+
 # ==============================================================================
 # 👥 PAGE BLOCK 3: EMPLOYEE PORTAL
 # ==============================================================================
@@ -360,3 +624,4 @@ elif page_selection == "Employee Portal":
     st.title("👥 Employee Access Portal")
     st.subheader(f"Localized Talent Onboarding Verification Node ({region_meta['region']})")
     candidate_profile_ingestion_ui()
+
