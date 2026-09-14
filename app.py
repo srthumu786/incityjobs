@@ -262,6 +262,7 @@ elif page_selection == "Employer Portal":
                         pass
                         
                     try:
+                        import psycopg2
                         db_url = "postgresql://neondb_owner:npg_MKul5P0djrzJ@ep-billowing-cloud-aeks7m5w-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
                         conn = psycopg2.connect(db_url)
                         cursor = conn.cursor()
@@ -284,7 +285,15 @@ elif page_selection == "Employer Portal":
                         conn.commit()
                         cursor.close()
                         conn.close()
-                        st.success("🎉 JOB REQUISITION SYSTEM DEPLOYED LIVE TO NEON CLUSTER!")
+                        
+                        st.success("🎉 **JOB REQUISITION SYSTEM DEPLOYED LIVE TO NEON CLUSTER!**")
+                        st.json({
+                            "requisition_title": job_title,
+                            "department": department_metric,
+                            "pricing": pricing_tier,
+                            "coordinates": [mock_site_lat, mock_site_lon],
+                            "status": "active_seeking_proximity_matches"
+                        })
                     except Exception as e:
                         st.error(f"❌ Database Synchronization Pipeline Failure: {str(e)}")
 
@@ -297,12 +306,13 @@ elif page_selection == "Employee Portal":
     candidate_profile_ingestion_ui()
     
     st.write("---")
-    st.markdown("### 📊 Live Proximity Matching Matrix")
-    st.caption("Step 3.4 — Real-Time Spatial Filtering Array (Max Radius: 25 Miles)")
+    st.markdown("### 📊 Live Proximity Matching Matrix & Spatial Map")
+    st.caption("Step 3.4 & 3.5 — Real-Time Spatial Filtering Array & Native Geospatial Mapping Matrix")
     
     try:
         db_url = "postgresql://neondb_owner:npg_MKul5P0djrzJ@ep-billowing-cloud-aeks7m5w-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
         import psycopg2
+        import pandas as pd
         from geopy.distance import geodesic
         
         conn = psycopg2.connect(db_url)
@@ -323,6 +333,9 @@ elif page_selection == "Employee Portal":
             
             st.info(f"Scanning target job footprints for candidate **{cand_name}** centered at target coordinates: `{cand_coords}`")
             
+            map_data = []
+            map_data.append({"latitude": cand_lat, "longitude": cand_lon, "name": f"Candidate: {cand_name}"})
+            
             match_found = False
             for job in active_jobs:
                 j_title, j_dept, j_price, j_addr, j_lat, j_lon = job
@@ -332,14 +345,22 @@ elif page_selection == "Employee Portal":
                 
                 if distance_miles <= 25:
                     match_found = True
+                    map_data.append({"latitude": j_lat, "longitude": j_lon, "name": f"Job: {j_title}"})
+                    
                     with st.expander(f"✨ MATCH FOUND: {j_title} ({j_dept}) — {round(distance_miles, 1)} Miles Away", expanded=True):
                         col1, col2 = st.columns(2)
                         with col1:
                             st.write(f"**Worksite Location:** {j_addr}")
                             st.write(f"**Distance Allocation:** {round(distance_miles, 2)} active miles.")
                         with col2:
-                            st.metric(label="System Billing Value", value=j_price.split(' ') if 'Locked' in j_price else j_price)
+                            st.metric(label="System Billing Value", value=str(j_price))
                             st.success("🎯 Match Status: High Proximity Verified")
+            
+            if map_data:
+                st.markdown("#### 🗺️ Interactive Proximity Footprint Radar")
+                df_map = pd.DataFrame(map_data)
+                st.map(df_map, zoom=11, use_container_width=True)
+                st.caption("Visual Legend: The interactive radar display plots your target profile center point relative to matching regional workplace openings.")
             
             if not match_found:
                 st.warning("🔍 Active scan complete: No vacancies currently found within a 25-mile boundary radius of your target deployment location.")
@@ -348,4 +369,3 @@ elif page_selection == "Employee Portal":
             
     except Exception as e:
         st.error(f"⚠️ Spatial Match Engine Query Interrupted: {str(e)}")
-
