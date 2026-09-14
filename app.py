@@ -99,11 +99,17 @@ def candidate_profile_ingestion_ui():
             
         submit_button = st.form_submit_button(label="Lock Profile & Validate Location Paths")
         
-    if submit_button:
-        # 1. First check if any mandatory text boxes are completely empty
+        if submit_button:
+        # 1. ENFORCE MANDATORY FIELDS: Prevent blank email strings from hitting the database
         if not candidate_name or not candidate_email or not t_zip or not resume_text:
-            st.error("❌ Critical fields missing. Name, Email, Resume, and Target Zip Code are mandatory attributes.")
+            st.error("❌ Critical Fields Missing: Candidate Name, Secure Email, Resume Text, and Target Zip Code are mandatory attributes.")
             return
+            
+        # 2. STRUCTURAL NODE VERIFICATION: Ensure the email is formatted correctly before ingestion
+        if "@" not in candidate_email or "." not in candidate_email:
+            st.error("❌ Invalid Communication Node: Please verify the structural syntax of your candidate email address.")
+            return
+
             
         # 2. Next verify that the email address syntax is structurally valid
         if "@" not in candidate_email or "." not in candidate_email:
