@@ -343,7 +343,7 @@ elif page_selection == "Employer Portal":
                         
                     try:
                         import psycopg2
-                        db_url = st.secrets["DB_URL"]
+                        db_url = st.secrets["connection_string"]
                         conn = psycopg2.connect(db_url)
                         cursor = conn.cursor()
                         cursor.execute("""
