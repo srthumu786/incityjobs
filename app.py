@@ -391,7 +391,7 @@ elif page_selection == "Employee Portal":
     st.caption("Step 3.4 & 3.5 — Real-Time Spatial Filtering Array & Native Geospatial Mapping Matrix")
     
     try:
-        db_url = st.secrets["DB_URL"]
+        db_url = st.secrets["connection_string"]
         import psycopg2
         import pandas as pd
         from geopy.distance import geodesic
@@ -599,7 +599,7 @@ def ai_contextual_matching_dashboard():
 
     if st.button("Run Autonomous AI & Geospatial Scanning Loop"):
         try:
-            db_url = st.secrets["DB_URL"]
+            db_url = st.secrets["connection_string"]
             conn = psycopg2.connect(db_url)
             cursor = conn.cursor()
         
