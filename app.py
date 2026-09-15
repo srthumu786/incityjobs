@@ -38,7 +38,7 @@ class InCityJobsDiagnostics:
         import psycopg2
         try:
             # Securely loads credentials from hidden local machine configurations
-            db_url = st.secrets["DB_URL"]
+            db_url = st.secrets["connection_string"]
             conn = psycopg2.connect(db_url)
             cursor = conn.cursor()
             cursor.execute("""
