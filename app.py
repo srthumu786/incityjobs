@@ -161,7 +161,7 @@ def candidate_profile_ingestion_ui():
             
             try:
                 # FIX: Securely route the data connection directly to your verified system secrets configuration link
-                db_url = st.secrets["DB_URL"]
+                db_url = st.secrets["connection_string"]
                 conn = psycopg2.connect(db_url)
                 cursor = conn.cursor()
             
