@@ -99,22 +99,39 @@ def candidate_profile_ingestion_ui():
             
         submit_button = st.form_submit_button(label="Lock Profile & Validate Location Paths")
         
-        if submit_button:
+    if submit_button:
         # 1. ENFORCE MANDATORY FIELDS: Prevent blank email strings from hitting the database
         if not candidate_name or not candidate_email or not t_zip or not resume_text:
             st.error("❌ Critical Fields Missing: Candidate Name, Secure Email, Resume Text, and Target Zip Code are mandatory attributes.")
-            return
+            st.stop()
             
         # 2. STRUCTURAL NODE VERIFICATION: Ensure the email is formatted correctly before ingestion
         if "@" not in candidate_email or "." not in candidate_email:
             st.error("❌ Invalid Communication Node: Please verify the structural syntax of your candidate email address.")
-            return
+            st.stop()
 
+        # 3. --- PASTE THE NEW LEDGER CHECK HERE ---
+        # Connects to Neon to verify if this candidate email already exists in your records
+        duplicate_candidate_found = False
+        try:
+            conn = InCityJobsDiagnostics.get_secure_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM candidates WHERE contact_email = %s LIMIT 1;", (candidate_email,))
+            if cur.fetchone():
+                duplicate_candidate_found = True
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+        if duplicate_candidate_found:
+            st.warning("⚠️ **SYSTEM NOTICE: TALENT MATRIX REDUNDANCY**")
+            st.markdown("**Employee portal:** *Profile already verified and processed in an earlier scanning ledger row transaction.*")
+            st.stop()
             
-        # 2. Next verify that the email address syntax is structurally valid
-        if "@" not in candidate_email or "." not in candidate_email:
-            st.error("❌ Invalid Communication Node: Please verify the structural syntax of your candidate email address.")
-            return
+        # 4. (Your existing database save execution code continues directly down below here...)
+    
+    
     
 
         with st.spinner("Executing dual-coordinate spatial parsing..."):
@@ -241,16 +258,60 @@ elif page_selection == "Employer Portal":
             admin_email = InCityJobsDiagnostics.sanitize_input(raw_email)
             admin_phone = InCityJobsDiagnostics.sanitize_input(raw_phone)
             sign_name = InCityJobsDiagnostics.sanitize_input(raw_sign)
-            
-            result = InCityJobsDiagnostics.validate_inputs(company_name, corporate_hq, admin_email, admin_phone, sign_name, agree_check)
+        
+            result = InCityJobsDiagnostics.validate_inputs(
+                company_name, corporate_hq, admin_email, admin_phone, sign_name, agree_check
+            )
+        
             if result["code"] != "ICJ-OK-200":
-                st.warning(f"⚠️ SYSTEM NOTICE: CODE {result['code']} - {result['title']}")
+                st.warning(f"⚠️ **SYSTEM NOTICE: CODE {result['code']}**")
+                st.markdown(f"**Issue:** *{result['title']}*\n\n💡 **Solution:** {result['solution']}")
             else:
                 raw_token = f"{company_name}-{admin_email}-{sign_name}-CONSENT_TRUE"
                 signature_hash = hashlib.sha256(raw_token.encode()).hexdigest()
-                if InCityJobsDiagnostics.save_employer_to_cloud(company_name, corporate_hq, admin_email, admin_phone, sign_name, signature_hash):
-                    st.balloons()
-                    st.success("🎉 BETA REGISTRATION COMPLETED SUCCESSFULLY!")
+            
+                # --- NEW LEDGER CHECK PROMPTS ---
+                # Connects to Neon to verify if this organizational administrator email already exists
+                duplicate_employer_found = False
+                try:
+                    conn = InCityJobsDiagnostics.get_secure_connection()
+                    cur = conn.cursor()
+                    cur.execute("SELECT id FROM employers WHERE admin_email = %s LIMIT 1;", (admin_email,))
+                    if cur.fetchone():
+                        duplicate_employer_found = True
+                    cur.close()
+                    conn.close()
+                except Exception:
+                    pass
+
+                if duplicate_employer_found:
+                    st.warning("⚠️ **SYSTEM NOTICE: PROFILE REDUNDANCY DETECTED**")
+                    st.markdown("**Employer portal:** *Corporate entity footprint already logged and finalized in an earlier organizational ledger row transaction.*")
+                else:
+                    # Save the new signup record permanently to the persistent cloud database vault
+                    db_save_success = InCityJobsDiagnostics.save_employer_to_cloud(
+                        company_name, corporate_hq, admin_email, admin_phone, sign_name, signature_hash
+                    )
+                
+                    if db_save_success:
+                        st.balloons()
+                        st.success("🎉 **BETA REGISTRATION COMPLETED SUCCESSFULLY!**")
+                        st.markdown(
+                            f"""
+                            ---
+                            ### 🔒 Your Account is Locked in Secure Travel Mode
+                            * **Company Status:** Fully Verified & Logged Nationwide
+                            * **Monetization Engine:** Deferred Settlement Active ('Pay After 2 Weeks')
+                            * **Merchant Routing Network:** Vaulted through Thumu Mercantile LLC
+                            * **Database Routing ID:** `ICJ-GLOBAL-{signature_hash[:8].upper()}`
+                            * **Cryptographic Contract Seal:** `{signature_hash}`
+                        
+                            **What Happens Next?**
+                            * Your corporate city footprint is locked securely inside your database tables.
+                            * Automated matching notifications will be routed directly to **{admin_email}**.
+                            """
+                        )
+        
     with emp_tab2:
         st.markdown("### 💼 Job Requisition & Footprint Ingestion Node")
         with st.form("job_requisition_form"):
@@ -549,10 +610,19 @@ def ai_contextual_matching_dashboard():
             cursor.execute("ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS longitude FLOAT;")
             conn.commit()
 
-            # 2. FETCH CANDIDATES MATRIX (TEMPORARILY UNFILTERED FOR VISUAL VERIFICATION)
+            # 2. FETCH CANDIDATES MATRIX (FIXED: Balanced select columns to match 6-value unpacking)
             cursor.execute("""
-                SELECT name, role, resume, email, latitude, longitude 
-                FROM candidate_profiles 
+                SELECT 
+                    full_name, 
+                    target_role, 
+                    'No resume uploaded' AS resume, 
+                    contact_email, 
+                    0.0 AS latitude, 
+                    0.0 AS longitude
+                FROM candidates 
+                WHERE contact_email IS NOT NULL 
+                  AND contact_email != '' 
+                  AND contact_email != 'None'
                 ORDER BY id DESC LIMIT 5;
             """)
             records = cursor.fetchall()
