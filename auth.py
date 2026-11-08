@@ -73,7 +73,14 @@ def password_problem(password: str, confirm: str) -> str:
 
 
 # --------------------------------------------------------------------------- tokens
-def issue_token(key: bytes, subject: str, role: str, ttl_seconds: int) -> str:
+def credential_fingerprint(key: bytes, stored_hash: str) -> str:
+    """Keyed fingerprint of the account's current password hash. It is put in the
+    session token and compared on every check, so changing the credential (any new
+    hash, even for the same password, has a new salt) revokes existing sessions."""
+    return hmac.new(key, (stored_hash or "").encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+
+def issue_token(key: bytes, subject: str, role: str, ttl_seconds: int, extra: dict = None) -> str:
     claims = {
         "sub": str(subject),
         "role": role,
@@ -81,6 +88,7 @@ def issue_token(key: bytes, subject: str, role: str, ttl_seconds: int) -> str:
         "exp": int(time.time()) + int(ttl_seconds),
         "nonce": secrets.token_hex(8),
     }
+    claims.update(extra or {})
     body = _b64e(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     signature = _b64e(hmac.new(key, body.encode("ascii"), hashlib.sha256).digest())
     return f"{body}.{signature}"

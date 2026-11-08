@@ -12,8 +12,17 @@ Migration safety rules:
   duplicates. If any exist, that constraint is skipped and reported, and the app
   keeps running with application-level duplicate checks. It is created on a
   later start once the duplicates have been cleaned up by hand.
+- A UNIQUE constraint only counts as active after the catalog confirms the index
+  is unique, valid, ready and live, on the expected expression and predicate.
+  report["complete"] is True only when every constraint passes that check.
+- Rows that carry the old geocoding fallback point are never modified; queries
+  exclude them via trusted_location_sql().
 """
+import uuid
+
 import psycopg2
+
+from matching import LEGACY_FALLBACK_COORDS
 
 BASE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS beta_employers (
@@ -32,6 +41,10 @@ CREATE TABLE IF NOT EXISTS beta_employers (
 ALTER TABLE beta_employers ADD COLUMN IF NOT EXISTS password_hash TEXT;
 ALTER TABLE beta_employers ADD COLUMN IF NOT EXISTS setup_code_hash VARCHAR(64);
 ALTER TABLE beta_employers ADD COLUMN IF NOT EXISTS setup_code_expires_at TIMESTAMPTZ;
+-- Employer verification: job posting requires verified_at to be set by a manager.
+-- Existing employers start unverified (NULL); no existing value is changed.
+ALTER TABLE beta_employers ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
+ALTER TABLE beta_employers ADD COLUMN IF NOT EXISTS verified_by VARCHAR(255);
 
 CREATE TABLE IF NOT EXISTS candidate_profiles (
     id SERIAL PRIMARY KEY,
@@ -154,44 +167,130 @@ def unique_index_exists(cur, index_name: str) -> bool:
     return cur.fetchone() is not None
 
 
+def verify_unique_index(cur, index_name: str, table: str, column: str) -> dict:
+    """Confirm from the system catalog that the index really enforces uniqueness:
+    unique, valid, ready, live, on `table`, keyed on lower(btrim(column)), with the
+    NULL/blank-excluding predicate. Returns {"active": bool, "problems": [...]}."""
+    cur.execute("""
+        SELECT i.indisunique, i.indisvalid, i.indisready, i.indislive, t.relname,
+               pg_get_indexdef(i.indexrelid), coalesce(pg_get_expr(i.indpred, i.indrelid), '')
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_index i ON i.indexrelid = c.oid
+        JOIN pg_class t ON t.oid = i.indrelid
+        WHERE c.relname = %s AND n.nspname = current_schema();
+    """, (index_name,))
+    row = cur.fetchone()
+    if row is None:
+        return {"active": False, "problems": ["index does not exist"]}
+    is_unique, is_valid, is_ready, is_live, on_table, definition, predicate = row
+    problems = []
+    if not is_unique:
+        problems.append("index is not UNIQUE")
+    if not (is_valid and is_ready and is_live):
+        problems.append("index is not valid/ready/live")
+    if on_table != table:
+        problems.append(f"index is on {on_table}, expected {table}")
+    if "lower(btrim(" not in definition or column not in definition:
+        problems.append(f"unexpected key expression: {definition}")
+    if column not in predicate or "btrim" not in predicate:
+        problems.append(f"unexpected predicate: {predicate or 'none'}")
+    return {"active": not problems, "problems": problems, "definition": definition}
+
+
+def _create_unique_index(cur, index_name, table, column, replace=False):
+    """Create (or rebuild) the UNIQUE index inside a savepoint. Returns an error string or None."""
+    cur.execute("SAVEPOINT add_unique_email;")
+    try:
+        if replace:
+            cur.execute(f"DROP INDEX {index_name};")
+        cur.execute(f"""
+            CREATE UNIQUE INDEX {index_name}
+            ON {table} ({email_key(column)})
+            WHERE {column} IS NOT NULL AND btrim({column}) <> '';
+        """)
+        cur.execute("RELEASE SAVEPOINT add_unique_email;")
+        return None
+    except psycopg2.Error as exc:
+        # e.g. a duplicate inserted between the check and the CREATE
+        cur.execute("ROLLBACK TO SAVEPOINT add_unique_email;")
+        return f"{type(exc).__name__}: {exc}"
+
+
+def trusted_location_sql(alias: str = "") -> str:
+    """SQL condition that excludes rows stored at the old geocoding fallback point."""
+    prefix = f"{alias}." if alias else ""
+    lat, lon = LEGACY_FALLBACK_COORDS
+    return f"NOT ({prefix}latitude IS NOT DISTINCT FROM {lat} AND {prefix}longitude IS NOT DISTINCT FROM {lon})"
+
+
+def legacy_fallback_counts(cur) -> dict:
+    lat, lon = LEGACY_FALLBACK_COORDS
+    counts = {}
+    for table in ("candidate_profiles", "employer_jobs"):
+        cur.execute(f"SELECT count(*) FROM {table} WHERE latitude = {lat} AND longitude = {lon};")
+        counts[table] = int(cur.fetchone()[0])
+    return counts
+
+
 def apply_schema(conn, commit: bool = True) -> dict:
     """Create/migrate all tables, then add the UNIQUE email constraints where the
-    existing data allows it. Commits on success unless commit=False (dry run:
-    the caller rolls back). Returns a report:
-        {"constraints": {table: {"status": ..., "profile": {...}, "duplicates": [...]}}}
-    status is one of: "enforced", "skipped_duplicates", "failed".
+    existing data allows it, and verify each one in the catalog. Commits on
+    success unless commit=False (dry run: the caller rolls back). Returns:
+        {"complete": bool,
+         "constraints": {table: {"status", "verification", "profile", "duplicates"}},
+         "legacy_fallback_rows": {table: count}}
+    status is one of: "enforced" (verified active), "skipped_duplicates",
+    "invalid_index" (exists but fails verification and can't be rebuilt), "failed".
     """
     report = {"constraints": {}}
     with conn.cursor() as cur:
         cur.execute(BASE_SCHEMA_SQL)
         for index_name, table, column in UNIQUE_EMAIL_CONSTRAINTS:
-            entry = {"index": index_name, "column": column, "profile": email_profile(cur, table, column), "duplicates": []}
-            if unique_index_exists(cur, index_name):
-                entry["status"] = "enforced"
+            entry = {"index": index_name, "column": column, "profile": email_profile(cur, table, column),
+                     "duplicates": find_duplicate_emails(cur, table, column)}
+            exists = unique_index_exists(cur, index_name)
+            check = verify_unique_index(cur, index_name, table, column) if exists else None
+
+            if exists and check["active"]:
+                pass  # already enforced
+            elif entry["duplicates"]:
+                entry["status"] = "invalid_index" if exists else "skipped_duplicates"
             else:
-                duplicates = find_duplicate_emails(cur, table, column)
-                if duplicates:
-                    entry["status"] = "skipped_duplicates"
-                    entry["duplicates"] = duplicates
-                else:
-                    cur.execute("SAVEPOINT add_unique_email;")
-                    try:
-                        cur.execute(f"""
-                            CREATE UNIQUE INDEX {index_name}
-                            ON {table} ({email_key(column)})
-                            WHERE {column} IS NOT NULL AND btrim({column}) <> '';
-                        """)
-                        cur.execute("RELEASE SAVEPOINT add_unique_email;")
-                        entry["status"] = "enforced"
-                    except psycopg2.Error as exc:
-                        # e.g. a duplicate inserted between the check and the CREATE
-                        cur.execute("ROLLBACK TO SAVEPOINT add_unique_email;")
-                        entry["status"] = "failed"
-                        entry["error"] = f"{type(exc).__name__}: {exc}"
+                error = _create_unique_index(cur, index_name, table, column, replace=exists)
+                if error:
+                    entry["error"] = error
+            check = verify_unique_index(cur, index_name, table, column)
+            entry["verification"] = check
+            entry.setdefault("status", "enforced" if check["active"] else "failed")
             report["constraints"][table] = entry
+        report["legacy_fallback_rows"] = legacy_fallback_counts(cur)
+    report["complete"] = all(e["status"] == "enforced" and e["verification"]["active"]
+                             for e in report["constraints"].values())
     if commit:
         conn.commit()
     return report
+
+
+def probe_unique_enforcement(conn) -> dict:
+    """Behavioural check: try to insert the same new email twice (second copy in a
+    different case with spaces) and confirm the database refuses it. Everything is
+    rolled back. Meant for a Neon TEST branch or local database, not production
+    (rolled-back inserts still advance the id sequences)."""
+    results = {}
+    with conn.cursor() as cur:
+        for _, table, column in UNIQUE_EMAIL_CONSTRAINTS:
+            email = f"probe-{uuid.uuid4().hex[:12]}@example.invalid"
+            cur.execute("SAVEPOINT unique_probe;")
+            try:
+                cur.execute(f"INSERT INTO {table} ({column}) VALUES (%s);", (email,))
+                cur.execute(f"INSERT INTO {table} ({column}) VALUES (%s);", (f"  {email.upper()} ",))
+                results[table] = "NOT ENFORCED (duplicate accepted)"
+            except psycopg2.Error as exc:
+                results[table] = "enforced" if is_unique_violation(exc) else f"error: {exc}"
+            cur.execute("ROLLBACK TO SAVEPOINT unique_probe;")
+    conn.rollback()
+    return results
 
 
 def is_unique_violation(exc: BaseException) -> bool:

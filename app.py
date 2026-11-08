@@ -19,6 +19,7 @@ import db_schema
 from matching import (
     CandidateRecord,
     JobCriteria,
+    LEGACY_FALLBACK_COORDS,
     MIN_SEMANTIC_SCORE,
     build_push_payload,
     evaluate_match,
@@ -77,11 +78,12 @@ def ensure_schema() -> dict:
     conn = _checkout_connection(pool)
     try:
         report = db_schema.apply_schema(conn)
-        not_enforced = {t: e for t, e in report["constraints"].items() if e["status"] != "enforced"}
-        if not_enforced:
+        if not report["complete"]:
+            # Uniqueness is not verified active; app-level duplicate checks still run
             detail = "; ".join(
-                f"{t}.{e['column']}: {e['status']} ({len(e['duplicates'])} duplicate email groups)"
-                for t, e in not_enforced.items()
+                f"{t}.{e['column']}: {e['status']} ({len(e['duplicates'])} duplicate email groups; "
+                f"{', '.join(e['verification']['problems']) or 'verified'})"
+                for t, e in report["constraints"].items() if e["status"] != "enforced" or not e["verification"]["active"]
             )
             logger.error("ICJ-ERR-511 [startup.schema.unique_email] %s", detail)
             # Written directly: the normal telemetry path depends on this function
@@ -214,16 +216,32 @@ def _manager_accounts() -> dict:
 
 def current_manager():
     """Username of the signed-in manager, or None. Checks the token's signature,
-    role and expiry, and that the account still exists in secrets."""
-    claims = auth.verify_token(_session_signing_key(), st.session_state.get("manager_token"), auth.ROLE_MANAGER)
-    if not claims or claims["sub"] not in _manager_accounts():
+    role and expiry, that the account still exists in secrets, and that its
+    password hash hasn't been replaced since sign-in (replacing it revokes the session)."""
+    key = _session_signing_key()
+    claims = auth.verify_token(key, st.session_state.get("manager_token"), auth.ROLE_MANAGER)
+    if not claims:
+        return None
+    stored_hash = _manager_accounts().get(claims["sub"])
+    if not stored_hash or claims.get("cred") != auth.credential_fingerprint(key, stored_hash):
         return None
     return claims["sub"]
 
 
-def _start_employer_session(employer_id: int, company_name: str) -> None:
+def _start_manager_session(username: str, stored_hash: str) -> None:
+    key = _session_signing_key()
+    st.session_state["manager_token"] = auth.issue_token(
+        key, username, auth.ROLE_MANAGER, MANAGER_SESSION_SECONDS,
+        extra={"cred": auth.credential_fingerprint(key, stored_hash)},
+    )
+    st.session_state["manager_failed_attempts"] = 0
+
+
+def _start_employer_session(employer_id: int, company_name: str, password_hash: str) -> None:
+    key = _session_signing_key()
     st.session_state["employer_token"] = auth.issue_token(
-        _session_signing_key(), employer_id, auth.ROLE_EMPLOYER, EMPLOYER_SESSION_SECONDS
+        key, employer_id, auth.ROLE_EMPLOYER, EMPLOYER_SESSION_SECONDS,
+        extra={"cred": auth.credential_fingerprint(key, password_hash)},
     )
     st.session_state["employer_company"] = company_name
     st.session_state["employer_failed_attempts"] = 0
@@ -234,10 +252,29 @@ def end_employer_session() -> None:
         st.session_state.pop(key, None)
 
 
-def current_employer_id():
-    """Employer id from a valid signed session token, or None."""
-    claims = auth.verify_token(_session_signing_key(), st.session_state.get("employer_token"), auth.ROLE_EMPLOYER)
-    return int(claims["sub"]) if claims else None
+def current_employer():
+    """The signed-in employer as {"id", "company", "verified"}, or None.
+
+    Valid only if the signed token checks out AND the account still exists with
+    the same password hash it had at sign-in. Any credential change (new password,
+    password removed) revokes every existing session for that employer."""
+    key = _session_signing_key()
+    claims = auth.verify_token(key, st.session_state.get("employer_token"), auth.ROLE_EMPLOYER)
+    if not claims:
+        return None
+    try:
+        with get_db_cursor() as cur:
+            cur.execute(
+                "SELECT company_name, password_hash, verified_at IS NOT NULL FROM beta_employers WHERE id = %s;",
+                (int(claims["sub"]),),
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        report_failure("ICJ-ERR-517", "employer_portal.session.verify", "❌ Your employer session could not be verified. Please try again.", e)
+        return None
+    if not row or not row[1] or claims.get("cred") != auth.credential_fingerprint(key, row[1]):
+        return None
+    return {"id": int(claims["sub"]), "company": row[0], "verified": bool(row[2])}
 
 
 # ==============================================================================
@@ -475,7 +512,7 @@ def _handle_employer_sign_in(email: str, password: str) -> None:
         return
 
     if row and row[2] and auth.verify_password(password or "", row[2]):
-        _start_employer_session(row[0], row[1])
+        _start_employer_session(row[0], row[1], row[2])
         st.rerun()
     if not (row and row[2]):
         auth.burn_verification_time(password or "")  # same timing whether or not the account exists
@@ -490,9 +527,11 @@ def _handle_setup_code(email: str, code: str, new_password: str, confirm: str) -
         return
     email_key = (email or "").strip().lower()
     code_hash = auth.hash_setup_code(code)
+    new_hash = auth.hash_password(new_password)
     try:
         with get_db_cursor() as cur:
-            # One-time: the UPDATE only succeeds while the unexpired code still matches
+            # One-time: the UPDATE only succeeds while the unexpired code still matches.
+            # The new password hash revokes every existing session for this employer.
             cur.execute("""
                 UPDATE beta_employers
                 SET password_hash = %s, setup_code_hash = NULL, setup_code_expires_at = NULL
@@ -504,14 +543,14 @@ def _handle_setup_code(email: str, code: str, new_password: str, confirm: str) -
                     ORDER BY id LIMIT 1
                 )
                 RETURNING id, company_name;
-            """, (auth.hash_password(new_password), email_key, code_hash))
+            """, (new_hash, email_key, code_hash))
             row = cur.fetchone()
     except Exception as e:
         report_failure("ICJ-ERR-513", "employer_portal.setup_code.redeem", "❌ The setup code could not be processed. Please try again.", e)
         return
 
     if row:
-        _start_employer_session(row[0], row[1])
+        _start_employer_session(row[0], row[1], new_hash)
         st.rerun()
     _register_failed_attempt("employer")
     st.error("Invalid or expired setup code for that email.")
@@ -549,10 +588,7 @@ def render_manager_access_panel():
         if submitted:
             stored_hash = accounts.get((username or "").strip())
             if stored_hash and auth.verify_password(password or "", stored_hash):
-                st.session_state["manager_token"] = auth.issue_token(
-                    _session_signing_key(), username.strip(), auth.ROLE_MANAGER, MANAGER_SESSION_SECONDS
-                )
-                st.session_state["manager_failed_attempts"] = 0
+                _start_manager_session(username.strip(), stored_hash)
                 st.rerun()
             if not stored_hash:
                 auth.burn_verification_time(password or "")
@@ -571,13 +607,15 @@ SIMULATION_REQUIREMENTS = "Looking for a specialized Python developer with stron
 
 
 def load_match_candidates():
-    """Candidates eligible for matching (most recent first, capped)."""
+    """Candidates eligible for matching (most recent first, capped). Historical rows
+    stored at the old geocoding fallback point are excluded (kept in the table)."""
     with get_db_cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT id, name, contact_email, role, resume, latitude, longitude
             FROM candidate_profiles
             WHERE contact_email IS NOT NULL AND btrim(contact_email) <> ''
               AND application_status <> 'REJECTED'
+              AND {db_schema.trusted_location_sql()}
             ORDER BY id DESC
             LIMIT %s;
         """, (MATCH_CANDIDATE_LIMIT,))
@@ -608,9 +646,10 @@ def live_matching_tab():
     )
     try:
         with get_db_cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT j.id, j.title, j.department, j.requirements, j.latitude, j.longitude,
-                       j.match_radius_miles, j.employer_id, e.admin_email, e.company_name
+                       j.match_radius_miles, j.employer_id, e.admin_email, e.company_name,
+                       e.verified_at IS NOT NULL, NOT ({db_schema.trusted_location_sql('j')})
                 FROM employer_jobs j
                 LEFT JOIN beta_employers e ON e.id = j.employer_id
                 ORDER BY j.id DESC
@@ -634,12 +673,20 @@ def live_matching_tab():
     st.write(f"**Radius:** {job.radius_miles:g} mi · **Minimum semantic score:** {job.min_semantic_score:g}% · "
              f"**Requirements:** {job.requirements or '_none recorded (legacy job): title and department only_'}")
 
+    employer_verified, legacy_fallback = bool(row[10]), bool(row[11])
     if not job.has_coordinates:
         st.warning("This job has no worksite coordinates, so it can't be matched.")
         return
-    can_log = job.employer_id is not None and bool(job.employer_email)
-    if not can_log:
-        st.info("This legacy job has no employer account, so results are shown but not logged.")
+    if legacy_fallback:
+        st.warning("This historical job is stored at the old unverified fallback location, so it is excluded from live matching. The record is kept unchanged.")
+        return
+    if job.employer_id is None or not job.employer_email:
+        st.warning("This legacy job has no employer account, so it is excluded from live matching.")
+        return
+    if not employer_verified:
+        st.warning("This job's employer is not verified, so it is excluded from live matching.")
+        return
+    can_log = True
 
     if not st.button("Run matching for this job", key="run_live_matching"):
         return
@@ -725,7 +772,7 @@ def employer_access_tab():
         with get_db_cursor() as cur:
             cur.execute("""
                 SELECT id, company_name, admin_email, password_hash IS NOT NULL,
-                       coalesce(setup_code_expires_at > now(), false)
+                       coalesce(setup_code_expires_at > now(), false), verified_at IS NOT NULL
                 FROM beta_employers ORDER BY id DESC LIMIT 500;
             """)
             employers = cur.fetchall()
@@ -737,13 +784,34 @@ def employer_access_tab():
         return
 
     def label(r):
-        state = "has password" if r[3] else "no password yet"
+        state = ["VERIFIED" if r[5] else "unverified", "has password" if r[3] else "no password yet"]
         if r[4]:
-            state += ", setup code active"
-        return f"#{r[0]} · {r[1]} · {r[2]} ({state})"
+            state.append("setup code active")
+        return f"#{r[0]} · {r[1]} · {r[2]} ({', '.join(state)})"
 
     options = {label(r): r for r in employers}
     chosen = options[st.selectbox("Employer", list(options))]
+
+    st.caption("Verify an employer only after confirming the company and its administrator through a channel you trust. "
+               "Unverified employers can sign in but cannot publish jobs.")
+    col_verify, col_revoke = st.columns(2)
+    with col_verify:
+        verify_clicked = st.button("Mark as verified", key="verify_employer", disabled=bool(chosen[5]))
+    with col_revoke:
+        revoke_clicked = st.button("Revoke verification", key="revoke_employer_verification", disabled=not chosen[5])
+    if verify_clicked or revoke_clicked:
+        try:
+            with get_db_cursor() as cur:
+                if verify_clicked:
+                    cur.execute("UPDATE beta_employers SET verified_at = now(), verified_by = %s WHERE id = %s;",
+                                (current_manager(), chosen[0]))
+                else:
+                    cur.execute("UPDATE beta_employers SET verified_at = NULL, verified_by = NULL WHERE id = %s;", (chosen[0],))
+        except Exception as e:
+            report_failure("ICJ-ERR-515", "manager_console.employer_access.verification", "❌ The verification change was not saved.", e)
+            return
+        st.success(f"{chosen[1]} is now {'verified' if verify_clicked else 'unverified'}.")
+        st.rerun()
     if st.button("Generate one-time setup code", key="issue_setup_code"):
         code = auth.new_setup_code()
         try:
@@ -798,15 +866,26 @@ def system_checks_tab():
     st.dataframe(deps, width="stretch")
 
     st.markdown("#### UNIQUE email constraints")
+    if report["complete"]:
+        st.success("Migration complete: database-level email uniqueness verified active in the catalog.")
+    else:
+        st.error("Migration NOT complete: email uniqueness is not verified active. App-level duplicate checks remain on.")
     for table, entry in report["constraints"].items():
         status = entry["status"]
-        icon = "✅" if status == "enforced" else "⚠️"
+        icon = "✅" if status == "enforced" and entry["verification"]["active"] else "⚠️"
         st.write(f"{icon} `{table}.{entry['column']}`: **{status}** · {entry['profile']}")
+        for problem in entry["verification"]["problems"]:
+            st.caption(f"Verification: {problem}")
         if entry["duplicates"]:
             st.warning("Duplicate emails block the constraint. Merge or correct these rows; the constraint is added on the next app restart.")
             st.dataframe([{"Email": d[0], "Copies": d[1], "Row ids": ", ".join(map(str, d[2]))} for d in entry["duplicates"]], width="stretch")
         if entry.get("error"):
             st.error(entry["error"])
+
+    st.markdown("#### Historical fallback-location records")
+    fallback = report["legacy_fallback_rows"]
+    st.write(f"Kept unchanged but excluded from matching and maps: **{fallback['candidate_profiles']}** candidate profile(s), "
+             f"**{fallback['employer_jobs']}** job(s) stored at the old fallback point {LEGACY_FALLBACK_COORDS}.")
 
 
 def manager_console():
@@ -911,22 +990,25 @@ elif page_selection == "Employer Portal":
                     report_failure("ICJ-ERR-504", "employer_portal.registration.duplicate_check", "❌ Could not verify existing registrations, so this registration was not saved. Please try again.", e)
 
                 new_employer = None
+                new_password_hash = auth.hash_password(reg_password)
                 if dup_check_failed:
                     st.info("No changes were made. Your details are still in the form above.")
                 elif not duplicate_employer_found:
-                    # Save the new signup record permanently to the persistent cloud database vault
+                    # Save the new signup record permanently to the persistent cloud database vault.
+                    # New accounts start UNVERIFIED (verified_at is NULL) and cannot post jobs yet.
                     new_employer = InCityJobsDiagnostics.save_employer_to_cloud(
                         company_name, corporate_hq, admin_email, admin_phone, sign_name, signature_hash,
-                        auth.hash_password(reg_password),
+                        new_password_hash,
                     )
 
                 if duplicate_employer_found or new_employer == "duplicate":
                     st.warning("⚠️ **SYSTEM NOTICE: PROFILE REDUNDANCY DETECTED**")
                     st.markdown("**Employer portal:** *Corporate entity footprint already logged and finalized in an earlier organizational ledger row transaction.*")
                 elif isinstance(new_employer, int):
-                    _start_employer_session(new_employer, company_name)
+                    _start_employer_session(new_employer, company_name, new_password_hash)
                     st.balloons()
-                    st.success("🎉 **BETA REGISTRATION COMPLETED SUCCESSFULLY!** You're signed in and can now post jobs in the **Post a Job** tab.")
+                    st.success("🎉 **BETA REGISTRATION COMPLETED SUCCESSFULLY!** You're signed in.")
+                    st.info("⏳ **Verification pending:** an InCityJobs manager will verify your company before job posting is unlocked.")
                     st.markdown(
                         f"""
                         ---
@@ -945,18 +1027,23 @@ elif page_selection == "Employer Portal":
 
     with emp_tab2:
         st.markdown("### 💼 Job Requisition & Footprint Ingestion Node")
-        if current_employer_id() is None:
-            end_employer_session()  # clear expired or invalid tokens
+        employer = current_employer()
+        if employer is None:
+            end_employer_session()  # clear expired, revoked or invalid tokens
             render_employer_sign_in()
         else:
             col_who, col_out = st.columns([3, 1])
             with col_who:
-                st.success(f"Signed in as **{st.session_state.get('employer_company') or 'employer'}**")
+                st.success(f"Signed in as **{employer['company'] or 'employer'}**")
             with col_out:
                 if st.button("Sign out", key="employer_sign_out"):
                     end_employer_session()
                     st.rerun()
 
+        if employer is not None and not employer["verified"]:
+            st.warning("⏳ **Verification pending.** Your company has not been verified yet, so job posting is locked. "
+                       "An InCityJobs manager will verify your account; no jobs can be published until then.")
+        elif employer is not None:
             with st.form("job_requisition_form"):
                 job_title = st.text_input("Job Position Title", placeholder="e.g., Heavy Equipment Operator")
                 department_metric = st.selectbox("Department Category Matrix", ["Logistics", "Manufacturing", "Technical Services", "Administrative", "Retail/Fulfillment"])
@@ -973,25 +1060,17 @@ elif page_selection == "Employer Portal":
                 job_submit = st.form_submit_button("PUBLISH LIVE REQUISITION", type="primary")
 
             if job_submit:
-                # Authorization is re-checked at submit time: valid signed token AND an
-                # employer account that still exists with a password.
-                employer_id = current_employer_id()
-                employer_row = None
-                if employer_id is not None:
-                    try:
-                        with get_db_cursor() as cur:
-                            cur.execute("SELECT company_name FROM beta_employers WHERE id = %s AND password_hash IS NOT NULL;", (employer_id,))
-                            employer_row = cur.fetchone()
-                    except Exception as e:
-                        report_failure("ICJ-ERR-517", "employer_portal.job_requisition.verify_employer", "❌ Your employer account could not be verified, so the job was not published.", e)
-                        employer_id = None
+                # Authorization is re-checked at submit time from the database: valid
+                # signed token, unchanged credentials, and a VERIFIED employer account.
+                submitting_employer = current_employer()
+                employer_id = submitting_employer["id"] if submitting_employer else None
 
                 site_full_addr = f"{site_address}, {site_city}, {site_state} {site_zip}".strip(" ,")
-                if employer_id is None:
-                    pass  # verification error already shown above
-                elif employer_row is None:
+                if submitting_employer is None or submitting_employer["id"] != employer["id"]:
                     end_employer_session()
-                    st.error("🔒 Your employer session is no longer valid. Please sign in again.")
+                    st.error("🔒 Your employer session is no longer valid, so the job was not published. Please sign in again.")
+                elif not submitting_employer["verified"]:
+                    st.error("🔒 Your company is not verified, so the job was not published.")
                 elif not job_title or not site_zip or not site_address or not job_requirements.strip():
                     st.error("❌ Operational criteria missing. Job title, requirements, worksite street address and ZIP code are required.")
                 else:
@@ -1055,11 +1134,15 @@ elif page_selection == "Employee Portal":
                 cursor.execute("SELECT name, latitude, longitude FROM candidate_profiles WHERE id = %s;", (my_candidate_id,))
                 latest_candidate = cursor.fetchone()
 
-                # Pull all job listings that have worksite coordinates
-                cursor.execute("""
-                    SELECT title, department, pricing_tier, address, latitude, longitude, match_radius_miles
-                    FROM employer_jobs
-                    WHERE latitude IS NOT NULL AND longitude IS NOT NULL;
+                # Active jobs only: posted by a VERIFIED employer, with real (geocoded)
+                # coordinates. Historical fallback-point and unattributed jobs are kept
+                # in the table but excluded here.
+                cursor.execute(f"""
+                    SELECT j.title, j.department, j.pricing_tier, j.address, j.latitude, j.longitude, j.match_radius_miles
+                    FROM employer_jobs j
+                    JOIN beta_employers e ON e.id = j.employer_id AND e.verified_at IS NOT NULL
+                    WHERE j.latitude IS NOT NULL AND j.longitude IS NOT NULL
+                      AND {db_schema.trusted_location_sql('j')};
                 """)
                 active_jobs = cursor.fetchall()
 

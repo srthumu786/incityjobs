@@ -10,6 +10,14 @@ from dataclasses import dataclass, field
 
 MIN_SEMANTIC_SCORE = 50.0  # percent; matches below this are gated
 
+# Earlier app versions stored this exact point whenever geocoding failed. Rows
+# carrying it have an unverified location: they are kept, but never matched.
+LEGACY_FALLBACK_COORDS = (34.5262, -86.9556)
+
+
+def is_legacy_fallback(latitude, longitude) -> bool:
+    return (latitude, longitude) == LEGACY_FALLBACK_COORDS
+
 
 class Phase4SemanticEngine:
     """Pillars 4.1, 4.2 & 4.3: Local Natural Language Parsing & Cosine Math Matrix."""
@@ -131,6 +139,10 @@ def evaluate_match(job: JobCriteria, candidate: CandidateRecord, engine=None, di
         return result(False, "Candidate location unknown")
     if not job.has_coordinates:
         return result(False, "Job location unknown")
+    if is_legacy_fallback(candidate.latitude, candidate.longitude):
+        return result(False, "Candidate location is an unverified legacy fallback point")
+    if is_legacy_fallback(job.latitude, job.longitude):
+        return result(False, "Job location is an unverified legacy fallback point")
 
     distance = round(distance_fn((candidate.latitude, candidate.longitude), (job.latitude, job.longitude)), 1)
     if distance > job.radius_miles:
