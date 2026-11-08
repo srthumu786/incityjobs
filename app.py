@@ -3,6 +3,147 @@ import streamlit as st
 import hashlib
 import re
 from datetime import datetime
+import math
+from contextlib import contextmanager
+
+import psycopg2
+import psycopg2.pool
+
+# ==============================================================================
+# 🗄️ CENTRALIZED DATABASE ACCESS (single pool + one-time schema setup)
+# ==============================================================================
+# Production tables used by every read, duplicate check and write in this app:
+#   beta_employers      - employer registrations (Employer Portal, tab 1)
+#   employer_jobs       - job requisitions        (Employer Portal, tab 2)
+#   candidate_profiles  - candidate profiles      (Employee Portal + Phase 4)
+#   semantic_matches    - Phase 4 match ledger
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS beta_employers (
+    id SERIAL PRIMARY KEY,
+    company_name VARCHAR(255),
+    corporate_hq TEXT,
+    admin_email VARCHAR(255),
+    admin_phone VARCHAR(50),
+    signature_hash VARCHAR(64),
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_beta_employers_admin_email
+    ON beta_employers (lower(admin_email));
+
+CREATE TABLE IF NOT EXISTS candidate_profiles (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255),
+    email VARCHAR(255),
+    role VARCHAR(255),
+    resume TEXT,
+    address TEXT,
+    current_address TEXT,
+    latitude FLOAT,
+    longitude FLOAT,
+    status VARCHAR(50),
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+-- Migrations for tables created by older versions of this app
+ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS current_address TEXT;
+CREATE INDEX IF NOT EXISTS idx_candidate_profiles_email
+    ON candidate_profiles (lower(email));
+
+CREATE TABLE IF NOT EXISTS employer_jobs (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(255),
+    department VARCHAR(100),
+    pricing_tier VARCHAR(100),
+    address TEXT,
+    latitude FLOAT,
+    longitude FLOAT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS semantic_matches (
+    id SERIAL PRIMARY KEY,
+    candidate_email VARCHAR(255),
+    employer_email VARCHAR(255),
+    match_score FLOAT,
+    distance_miles FLOAT,
+    status VARCHAR(100),
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+@st.cache_resource(show_spinner=False)
+def _get_db_pool():
+    """One thread-safe connection pool per server process, shared by every session."""
+    return psycopg2.pool.ThreadedConnectionPool(
+        minconn=1,
+        maxconn=10,
+        dsn=st.secrets["connection_string"],
+        connect_timeout=10,
+    )
+
+
+def _checkout_connection(pool):
+    """Borrow a connection, replacing it if the server dropped it while idle
+    (Neon closes idle connections when the compute scales to zero)."""
+    conn = pool.getconn()
+    try:
+        if conn.closed:
+            raise psycopg2.InterfaceError("connection already closed")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+        conn.rollback()
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        pool.putconn(conn, close=True)
+        conn = pool.getconn()
+    return conn
+
+
+def _release_connection(pool, conn):
+    pool.putconn(conn, close=bool(conn.closed))
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_schema() -> bool:
+    """Create/migrate the production tables once per server process.
+    A failure is not cached, so the next request simply retries."""
+    pool = _get_db_pool()
+    conn = _checkout_connection(pool)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA_SQL)
+        conn.commit()
+    except Exception:
+        if not conn.closed:
+            conn.rollback()
+        raise
+    finally:
+        _release_connection(pool, conn)
+    return True
+
+
+@contextmanager
+def get_db_cursor():
+    """Yield a cursor on a pooled connection.
+    Commits when the block finishes, rolls back on error, and always returns the
+    connection to the pool. Usage:
+        with get_db_cursor() as cur:
+            cur.execute("SELECT ...", (param,))
+    """
+    ensure_schema()
+    pool = _get_db_pool()
+    conn = _checkout_connection(pool)
+    try:
+        with conn.cursor() as cur:
+            yield cur
+        conn.commit()
+    except BaseException:
+        if not conn.closed:
+            conn.rollback()
+        raise
+    finally:
+        _release_connection(pool, conn)
+
 
 # Initialize deep session cache flags to prevent layout resetting loops
 if 'last_ingested_candidate' not in st.session_state:
@@ -35,38 +176,19 @@ class InCityJobsDiagnostics:
 
     @staticmethod
     def save_employer_to_cloud(company, hq, email, phone, sign, signature_hash) -> bool:
-        import psycopg2
         try:
-            # Securely loads credentials from hidden local machine configurations
-            db_url = st.secrets["connection_string"]
-            conn = psycopg2.connect(db_url)
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS beta_employers (
-                    id SERIAL PRIMARY KEY,
-                    company_name VARCHAR(255),
-                    corporate_hq TEXT,
-                    admin_email VARCHAR(255),
-                    admin_phone VARCHAR(50),
-                    signature_hash VARCHAR(64),
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            cursor.execute("""
-                INSERT INTO beta_employers (company_name, corporate_hq, admin_email, admin_phone, signature_hash)
-                VALUES (%s, %s, %s, %s, %s);
-            """, (company, hq, email, phone, signature_hash))
-            conn.commit()
-            cursor.close()
-            conn.close()
+            with get_db_cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO beta_employers (company_name, corporate_hq, admin_email, admin_phone, signature_hash)
+                    VALUES (%s, %s, %s, %s, %s);
+                """, (company, hq, email, phone, signature_hash))
             return True
         except Exception as e:
             st.error(f"Cloud Storage Write Interrupted: {str(e)}")
             return False
 
-   
+
 def candidate_profile_ingestion_ui():
-    import psycopg2
     
     st.markdown("## 👤 Candidate Profile Ingestion Matrix")
     st.caption("Phase 3: Core Hiring Automation & Core Workflows — Step 3.1 & 3.3 (Split Location Matrix)")
@@ -105,35 +227,29 @@ def candidate_profile_ingestion_ui():
             st.error("❌ Critical Fields Missing: Candidate Name, Secure Email, Resume Text, and Target Zip Code are mandatory attributes.")
             st.stop()
             
+        # Normalize the email so duplicate checks are case-insensitive
+        candidate_email = candidate_email.strip().lower()
+
         # 2. STRUCTURAL NODE VERIFICATION: Ensure the email is formatted correctly before ingestion
         if "@" not in candidate_email or "." not in candidate_email:
             st.error("❌ Invalid Communication Node: Please verify the structural syntax of your candidate email address.")
             st.stop()
 
-        # 3. --- PASTE THE NEW LEDGER CHECK HERE ---
-        # Connects to Neon to verify if this candidate email already exists in your records
-        duplicate_candidate_found = False
+        # 3. LEDGER CHECK: is this email already registered in candidate_profiles?
         try:
-            conn = InCityJobsDiagnostics.get_secure_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT id FROM candidates WHERE contact_email = %s LIMIT 1;", (candidate_email,))
-            if cur.fetchone():
-                duplicate_candidate_found = True
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
+            with get_db_cursor() as cur:
+                cur.execute("SELECT 1 FROM candidate_profiles WHERE lower(email) = %s LIMIT 1;", (candidate_email,))
+                duplicate_candidate_found = cur.fetchone() is not None
+        except Exception as e:
+            st.error(f"❌ Could not verify existing profiles: {str(e)}")
+            st.stop()
 
         if duplicate_candidate_found:
             st.warning("⚠️ **SYSTEM NOTICE: TALENT MATRIX REDUNDANCY**")
             st.markdown("**Employee portal:** *Profile already verified and processed in an earlier scanning ledger row transaction.*")
             st.stop()
-            
-        # 4. (Your existing database save execution code continues directly down below here...)
-    
-    
-    
 
+        # 4. Geocode the target location, then save the profile
         with st.spinner("Executing dual-coordinate spatial parsing..."):
             current_full_addr = f"{c_street}, {c_city}, {c_state}".strip(", ")
             target_full_addr = f"{t_street}, {t_city}, {t_state} {t_zip}".strip()
@@ -160,38 +276,12 @@ def candidate_profile_ingestion_ui():
                 fallback_triggered = True
             
             try:
-                # FIX: Securely route the data connection directly to your verified system secrets configuration link
-                db_url = st.secrets["connection_string"]
-                conn = psycopg2.connect(db_url)
-                cursor = conn.cursor()
-            
-                
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS candidate_profiles (
-                        id SERIAL PRIMARY KEY,
-                        name VARCHAR(255),
-                        role VARCHAR(255),
-                        resume TEXT,
-                        address TEXT,
-                        current_address TEXT,
-                        latitude FLOAT,
-                        longitude FLOAT,
-                        status VARCHAR(50),
-                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                """)
-                
-                cursor.execute("ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS current_address TEXT;")
-                
-                cursor.execute("""
-                    INSERT INTO candidate_profiles (name, role, resume, address, current_address, latitude, longitude, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
-                """, (candidate_name, target_role, resume_text, target_full_addr, current_full_addr, target_lat, target_lon, "active_matching_pool"))
-                
-                conn.commit()
-                cursor.close()
-                conn.close()
-                
+                with get_db_cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO candidate_profiles (name, email, role, resume, address, current_address, latitude, longitude, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                    """, (candidate_name, candidate_email, target_role, resume_text, target_full_addr, current_full_addr, target_lat, target_lon, "active_matching_pool"))
+
                 if fallback_triggered:
                     st.warning("ℹ️ **Proximity Mapping Complete:** The system couldn't verify that target street combo. Pinned to regional coordinates.")
                 else:
@@ -255,7 +345,7 @@ elif page_selection == "Employer Portal":
         if submit_btn:
             company_name = InCityJobsDiagnostics.sanitize_input(raw_company)
             corporate_hq = InCityJobsDiagnostics.sanitize_input(raw_hq)
-            admin_email = InCityJobsDiagnostics.sanitize_input(raw_email)
+            admin_email = InCityJobsDiagnostics.sanitize_input(raw_email).lower()
             admin_phone = InCityJobsDiagnostics.sanitize_input(raw_phone)
             sign_name = InCityJobsDiagnostics.sanitize_input(raw_sign)
         
@@ -270,21 +360,20 @@ elif page_selection == "Employer Portal":
                 raw_token = f"{company_name}-{admin_email}-{sign_name}-CONSENT_TRUE"
                 signature_hash = hashlib.sha256(raw_token.encode()).hexdigest()
             
-                # --- NEW LEDGER CHECK PROMPTS ---
-                # Connects to Neon to verify if this organizational administrator email already exists
+                # --- LEDGER CHECK: is this administrator email already in beta_employers? ---
                 duplicate_employer_found = False
+                dup_check_failed = False
                 try:
-                    conn = InCityJobsDiagnostics.get_secure_connection()
-                    cur = conn.cursor()
-                    cur.execute("SELECT id FROM employers WHERE admin_email = %s LIMIT 1;", (admin_email,))
-                    if cur.fetchone():
-                        duplicate_employer_found = True
-                    cur.close()
-                    conn.close()
-                except Exception:
-                    pass
+                    with get_db_cursor() as cur:
+                        cur.execute("SELECT 1 FROM beta_employers WHERE lower(admin_email) = %s LIMIT 1;", (admin_email,))
+                        duplicate_employer_found = cur.fetchone() is not None
+                except Exception as e:
+                    dup_check_failed = True
+                    st.error(f"❌ Could not verify existing registrations: {str(e)}")
 
-                if duplicate_employer_found:
+                if dup_check_failed:
+                    pass
+                elif duplicate_employer_found:
                     st.warning("⚠️ **SYSTEM NOTICE: PROFILE REDUNDANCY DETECTED**")
                     st.markdown("**Employer portal:** *Corporate entity footprint already logged and finalized in an earlier organizational ledger row transaction.*")
                 else:
@@ -342,30 +431,12 @@ elif page_selection == "Employer Portal":
                         pass
                         
                     try:
-                        import psycopg2
-                        db_url = st.secrets["connection_string"]
-                        conn = psycopg2.connect(db_url)
-                        cursor = conn.cursor()
-                        cursor.execute("""
-                            CREATE TABLE IF NOT EXISTS employer_jobs (
-                                id SERIAL PRIMARY KEY,
-                                title VARCHAR(255),
-                                department VARCHAR(100),
-                                pricing_tier VARCHAR(100),
-                                address TEXT,
-                                latitude FLOAT,
-                                longitude FLOAT,
-                                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                            );
-                        """)
-                        cursor.execute("""
-                            INSERT INTO employer_jobs (title, department, pricing_tier, address, latitude, longitude)
-                            VALUES (%s, %s, %s, %s, %s, %s);
-                        """, (job_title, department_metric, pricing_tier, f"{site_address}, {site_city}, {site_state} {site_zip}".strip(), mock_site_lat, mock_site_lon))
-                        conn.commit()
-                        cursor.close()
-                        conn.close()
-                        
+                        with get_db_cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO employer_jobs (title, department, pricing_tier, address, latitude, longitude)
+                                VALUES (%s, %s, %s, %s, %s, %s);
+                            """, (job_title, department_metric, pricing_tier, f"{site_address}, {site_city}, {site_state} {site_zip}".strip(), mock_site_lat, mock_site_lon))
+
                         st.success("🎉 **JOB REQUISITION SYSTEM DEPLOYED LIVE TO NEON CLUSTER!**")
                         st.json({
                             "requisition_title": job_title,
@@ -391,25 +462,18 @@ elif page_selection == "Employee Portal":
     st.caption("Step 3.4 & 3.5 — Real-Time Spatial Filtering Array & Native Geospatial Mapping Matrix")
     
     try:
-        db_url = st.secrets["connection_string"]
-        import psycopg2
         import pandas as pd
         from geopy.distance import geodesic
-        
-        conn = psycopg2.connect(db_url)
-        cursor = conn.cursor()
-        
-        # Fetch the last profile coordinates submitted on this local terminal instance
-        cursor.execute("SELECT name, latitude, longitude FROM candidate_profiles ORDER BY id DESC LIMIT 1;")
-        latest_candidate = cursor.fetchone()
-        
-        # Pull all active job listings from the employer database table
-        cursor.execute("SELECT title, department, pricing_tier, address, latitude, longitude FROM employer_jobs;")
-        active_jobs = cursor.fetchall()
-        
-        cursor.close()
-        conn.close()
-        
+
+        with get_db_cursor() as cursor:
+            # Fetch the most recently submitted candidate profile
+            cursor.execute("SELECT name, latitude, longitude FROM candidate_profiles ORDER BY id DESC LIMIT 1;")
+            latest_candidate = cursor.fetchone()
+
+            # Pull all active job listings from the employer database table
+            cursor.execute("SELECT title, department, pricing_tier, address, latitude, longitude FROM employer_jobs;")
+            active_jobs = cursor.fetchall()
+
         if latest_candidate and active_jobs:
             cand_name, cand_lat, cand_lon = latest_candidate
             cand_coords = (cand_lat, cand_lon)
@@ -521,62 +585,6 @@ class Phase4SemanticEngine:
 
 def ai_contextual_matching_dashboard():
     """Renders the final visual matrix workspace comparing jobs vs candidates."""
-    import psycopg2
-    st.markdown("---")
-    st.markdown("## 🧠 Phase 4: Artificial Intelligence & Profile Matching Matrix")
-    st.caption("Contextual Intelligence Engine — Real-time Semantic Vector Overlap Scoring")
-
-    # Hardcoded test sandbox job framework so you can instantly verify accuracy
-    sandbox_job_requirement = st.text_area(
-        "💼 Target Job Opening Requirements Matrix (Reference Standard)",
-        value="Looking for a specialized Python developer with strong expertise running relational SQL databases and deploying microservices inside Docker containers.",
-        height=70
-    )
-
-    if st.button("Run Phase 4 Semantic Engine Scanning Loop"):
-        db_url = st.secrets["connection_string"]
-        try:
-            conn = psycopg2.connect(db_url)
-            cursor = conn.cursor()
-            
-            # Fetch candidates stored securely inside your Neon database cluster
-            cursor.execute("SELECT name, role, resume FROM candidate_profiles ORDER BY id DESC LIMIT 5;")
-            records = cursor.fetchall()
-            cursor.close()
-            conn.close()
-
-            if not records:
-                st.info("💡 Processing workspace idle. No records currently populate the matching pool table layout.")
-                return
-
-            ai_engine = Phase4SemanticEngine()
-
-            st.markdown("### 📊 Live Core AI Match Results")
-            for name, role, resume in records:
-                # Execute the math functions
-                analysis = ai_engine.calculate_match(resume, sandbox_job_requirement)
-                
-                # Visual rendering layout
-                with st.expander(f"👤 Candidate: {name} — Target: {role}"):
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("AI Semantic Score", f"{analysis['semantic_percentage']}%")
-                    with col2:
-                        st.write("**Extracted Skills Found:**")
-                        st.json(analysis['matched_skills'])
-                        
-                    st.write("**Raw Cleaned Text Snippet:**")
-                    st.text(resume[:200] + "...")
-                    
-        except Exception as e:
-            st.error(f"Failed to access candidate pool records: {str(e)}")
-
-# Master entry node execution call
-
-def ai_contextual_matching_dashboard():
-    """Renders the final visual matrix workspace comparing jobs vs candidates."""
-    import psycopg2
-    
     from geopy.distance import geodesic  # Ensure geopy is utilized for precise radius gates
 
     st.markdown("---")
@@ -599,180 +607,100 @@ def ai_contextual_matching_dashboard():
 
     if st.button("Run Autonomous AI & Geospatial Scanning Loop"):
         try:
-            db_url = st.secrets["connection_string"]
-            conn = psycopg2.connect(db_url)
-            cursor = conn.cursor()
-        
-            # Fetch candidates along with spatial metrics and contact nodes
-            # 1. THE SAFETY PATCH RUNS FIRST
-            cursor.execute("ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS email VARCHAR(255);")
-            cursor.execute("ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS latitude FLOAT;")
-            cursor.execute("ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS longitude FLOAT;")
-            conn.commit()
-
-            # 2. FETCH CANDIDATES MATRIX (FIXED: Balanced select columns to match 6-value unpacking)
-            cursor.execute("""
-                SELECT 
-                    full_name, 
-                    target_role, 
-                    'No resume uploaded' AS resume, 
-                    contact_email, 
-                    0.0 AS latitude, 
-                    0.0 AS longitude
-                FROM candidates 
-                WHERE contact_email IS NOT NULL 
-                  AND contact_email != '' 
-                  AND contact_email != 'None'
-                ORDER BY id DESC LIMIT 5;
-            """)
-            records = cursor.fetchall()
-            
-            
-            
-            # NOTE: We removed the duplicate block and delayed closing the connection here!
-            
-            if not records:
-                st.info("💡 Processing workspace idle. No records currently populate the matching pool.")
-                return
-
-            ai_engine = Phase4SemanticEngine()
-            employer_email = "recruiter@mycityjobs.us" # Production recruiter communication endpoint node
-
-            st.markdown("### 📊 Live AI Scan Execution Metrics")
-            for name, role, resume, email, c_lat, c_lon in records:
-            
-                # A. Run AI Contextual Text Parsing and Vector Math
-                analysis = ai_engine.calculate_match(resume, sandbox_job_requirement)
-                semantic_pct = analysis['semantic_percentage']
-            
-                # B. Run Real-Time Geospatial Distance Verification
-                distance_miles = 0.0
-                if c_lat and c_lon:
-                    candidate_coords = (c_lat, c_lon)
-                    employer_coords = (employer_lat, employer_lon)
-                    distance_miles = round(geodesic(candidate_coords, employer_coords).miles, 1)
-            # Execute the two-way transactional push instantly inside the loop with zero human intervention
-            try:
-                conn = psycopg2.connect(db_url)
-                cursor = conn.cursor()
+            with get_db_cursor() as cursor:
+                # Read the same production table the Employee Portal writes to
                 cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS semantic_matches (
-                        id SERIAL PRIMARY KEY,
-                        candidate_email VARCHAR(255),
-                        employer_email VARCHAR(255),
-                        match_score FLOAT,
-                        distance_miles FLOAT,
-                        status VARCHAR(100),
-                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
+                    SELECT name, role, resume, email, latitude, longitude
+                    FROM candidate_profiles
+                    WHERE email IS NOT NULL AND email <> ''
+                    ORDER BY id DESC LIMIT 5;
                 """)
-            
-                # Check if this exact connection pair was already autonomously pushed to prevent spam duplicates
-                cursor.execute("""
-                    SELECT id FROM semantic_matches 
-                    WHERE candidate_email = %s AND employer_email = %s AND status = 'autonomous_pushed_dual';
-                """, (email, employer_email))
-                already_pushed = cursor.fetchone()
-            
-                if not already_pushed:
-                    cursor.execute("""
-                        INSERT INTO semantic_matches (candidate_email, employer_email, match_score, distance_miles, status)
-                        VALUES (%s, %s, %s, %s, %s);
-                    """, (email, employer_email, semantic_pct, distance_miles, "autonomous_pushed_dual"))
-                    conn.commit()
-                    st.toast(f"Autonomous connection locked for {name}!")
-                    st.balloons()
-                    st.info(f"📬 [AI AUTO-PUSH 1 -> CANDIDATE]: Position metrics securely sent to **{email}**.")
-                    st.info(f"📬 [AI AUTO-PUSH 2 -> EMPLOYER]: Candidate resume securely sent to **{employer_email}**.")
-                else:
-                    st.warning("ℹ️ Profile already verified and processed in an earlier scanning ledger row transaction.")
-                
-                cursor.close()
-                conn.close()
-            
-            except Exception as auto_push_err:
-                st.error(f"AI self-trigger database transaction write failed: {str(auto_push_err)}")
-            
-                # C. Check if profile satisfies the absolute multi-dimensional match matrix thresholds
-                is_geo_valid = distance_miles <= max_allowed_radius
-                is_semantic_valid = semantic_pct >= 50.0  # Core threshold boundary
-                ai_match_verified = is_geo_valid and is_semantic_valid and email
-            
-                # Visual rendering container card based on AI processing decision
-                status_emoji = "✅ AUTONOMOUSLY PUSHED" if ai_match_verified else "❌ GATED (Sub-optimal Match)"
-            
-                with st.expander(f"👤 Candidate: {name} — Strategy: {status_emoji}"):
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("AI Semantic Score", f"{semantic_pct}%")
-                    with col2:
-                        st.metric("Physical Proximity", f"{distance_miles} Miles")
-                    with col3:
-                        st.write("**Target Skills Found:**")
-                        st.text(", ".join(analysis['matched_skills']) if analysis['matched_skills'] else "None")
+                records = cursor.fetchall()
+        except Exception as e:
+            st.error(f"Failed to access verification matrix records: {str(e)}")
+            return
 
-                    st.markdown("---")
-                    st.write("### 🤖 AI Processing Log Output")
-                
-                    if not email:
-                        st.error("🔒 Profile skipped: Missing a valid candidate communication email endpoint node.")
-                    elif not is_geo_valid:
-                        st.error(f"🔒 Profile skipped: Out of bounds. Located {distance_miles} miles away (Max limit: {max_allowed_radius} miles).")
-                    elif not is_semantic_valid:
-                        st.error(f"🔒 Profile skipped: AI semantic text profile score ({semantic_pct}%) fails to clear target match benchmark threshold.")
-                
-                    # 🚀 AUTOMATIC SELF-TRIGGER ACTIVATION NODE
-                    else:
-                        st.success("⚡ **AI VERIFICATION PASSED:** Initializing automatic dual-routing connections...")
-                    
-                        # Execute the two-way transactional push instantly inside the loop with zero human intervention
-                        try:
-                            conn = psycopg2.connect(db_url)
-                            cursor = conn.cursor()
+        if not records:
+            st.info("💡 Processing workspace idle. No records currently populate the matching pool.")
+            return
+
+        ai_engine = Phase4SemanticEngine()
+        employer_email = "recruiter@mycityjobs.us"  # Production recruiter communication endpoint node
+
+        st.markdown("### 📊 Live AI Scan Execution Metrics")
+        for name, role, resume, email, c_lat, c_lon in records:
+
+            # A. Run AI Contextual Text Parsing and Vector Math
+            analysis = ai_engine.calculate_match(resume, sandbox_job_requirement)
+            semantic_pct = analysis['semantic_percentage']
+
+            # B. Run Real-Time Geospatial Distance Verification
+            distance_miles = 0.0
+            if c_lat and c_lon:
+                candidate_coords = (c_lat, c_lon)
+                employer_coords = (employer_lat, employer_lon)
+                distance_miles = round(geodesic(candidate_coords, employer_coords).miles, 1)
+
+            # C. Check if profile satisfies the multi-dimensional match thresholds
+            is_geo_valid = distance_miles <= max_allowed_radius
+            is_semantic_valid = semantic_pct >= 50.0  # Core threshold boundary
+            ai_match_verified = is_geo_valid and is_semantic_valid and email
+
+            # Visual rendering container card based on AI processing decision
+            status_emoji = "✅ AUTONOMOUSLY PUSHED" if ai_match_verified else "❌ GATED (Sub-optimal Match)"
+
+            with st.expander(f"👤 Candidate: {name} — Strategy: {status_emoji}"):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("AI Semantic Score", f"{semantic_pct}%")
+                with col2:
+                    st.metric("Physical Proximity", f"{distance_miles} Miles")
+                with col3:
+                    st.write("**Target Skills Found:**")
+                    st.text(", ".join(analysis['matched_skills']) if analysis['matched_skills'] else "None")
+
+                st.markdown("---")
+                st.write("### 🤖 AI Processing Log Output")
+
+                if not email:
+                    st.error("🔒 Profile skipped: Missing a valid candidate communication email endpoint node.")
+                elif not is_geo_valid:
+                    st.error(f"🔒 Profile skipped: Out of bounds. Located {distance_miles} miles away (Max limit: {max_allowed_radius} miles).")
+                elif not is_semantic_valid:
+                    st.error(f"🔒 Profile skipped: AI semantic text profile score ({semantic_pct}%) fails to clear target match benchmark threshold.")
+
+                # 🚀 AUTOMATIC SELF-TRIGGER ACTIVATION NODE (only for verified matches)
+                else:
+                    st.success("⚡ **AI VERIFICATION PASSED:** Initializing automatic dual-routing connections...")
+                    try:
+                        with get_db_cursor() as cursor:
+                            # Skip pairs that were already pushed to prevent duplicates
                             cursor.execute("""
-                                CREATE TABLE IF NOT EXISTS semantic_matches (
-                                    id SERIAL PRIMARY KEY,
-                                    candidate_email VARCHAR(255),
-                                    employer_email VARCHAR(255),
-                                    match_score FLOAT,
-                                    distance_miles FLOAT,
-                                    status VARCHAR(100),
-                                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                                );
-                            """)
-                        
-                            # Check if this exact connection pair was already autonomously pushed to prevent spam duplicates
-                            cursor.execute("""
-                                SELECT id FROM semantic_matches 
-                                WHERE candidate_email = %s AND employer_email = %s AND status = 'autonomous_pushed_dual';
+                                SELECT 1 FROM semantic_matches
+                                WHERE candidate_email = %s AND employer_email = %s AND status = 'autonomous_pushed_dual'
+                                LIMIT 1;
                             """, (email, employer_email))
-                            already_pushed = cursor.fetchone()
-                        
+                            already_pushed = cursor.fetchone() is not None
+
                             if not already_pushed:
                                 cursor.execute("""
                                     INSERT INTO semantic_matches (candidate_email, employer_email, match_score, distance_miles, status)
                                     VALUES (%s, %s, %s, %s, %s);
                                 """, (email, employer_email, semantic_pct, distance_miles, "autonomous_pushed_dual"))
-                                conn.commit()
-                                st.toast(f"Autonomous connection locked for {name}!")
-                                st.balloons()
-                                st.info(f"📬 [AI AUTO-PUSH 1 -> CANDIDATE]: Position metrics securely sent to **{email}**.")
-                                st.info(f"📬 [AI AUTO-PUSH 2 -> EMPLOYER]: Candidate resume securely sent to **{employer_email}**.")
-                            else:
-                                st.warning("ℹ️ Profile already verified and processed in an earlier scanning ledger row transaction.")
-                            
-                            cursor.close()
-                            conn.close()
-                        
-                        except Exception as auto_push_err:
-                            st.error(f"AI self-trigger database transaction write failed: {str(auto_push_err)}")
-                                
-        except Exception as e:
-            st.error(f"Failed to access verification matrix records: {str(e)}")
+
+                        if not already_pushed:
+                            st.toast(f"Autonomous connection locked for {name}!")
+                            st.balloons()
+                            st.info(f"📬 [AI AUTO-PUSH 1 -> CANDIDATE]: Position metrics securely sent to **{email}**.")
+                            st.info(f"📬 [AI AUTO-PUSH 2 -> EMPLOYER]: Candidate resume securely sent to **{employer_email}**.")
+                        else:
+                            st.warning("ℹ️ Profile already verified and processed in an earlier scanning ledger row transaction.")
+
+                    except Exception as auto_push_err:
+                        st.error(f"AI self-trigger database transaction write failed: {str(auto_push_err)}")
 
 # Master entry node execution call (PERFECT PORTAL ISOLATION)
 if __name__ == "__main__":
-    import math
     
     # Check your exact sidebar variable 'page_selection'
     # If the user is on the Home Portal, skip it entirely. Only render on Employee/Employer sub-menus!
