@@ -534,7 +534,7 @@ def ai_contextual_matching_dashboard():
     )
 
     if st.button("Run Phase 4 Semantic Engine Scanning Loop"):
-        db_url = "postgresql://neondb_owner:npg_MKul5P0djrzJ@ep-billowing-cloud-aeks7m5w-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+        db_url = st.secrets["connection_string"]
         try:
             conn = psycopg2.connect(db_url)
             cursor = conn.cursor()
