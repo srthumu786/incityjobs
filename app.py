@@ -2,12 +2,18 @@
 import streamlit as st
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 import math
+import hmac
+import json
+import logging
+import time
 from contextlib import contextmanager
 
 import psycopg2
 import psycopg2.pool
+
+logger = logging.getLogger("incityjobs")
 
 # ==============================================================================
 # 🗄️ CENTRALIZED DATABASE ACCESS (single pool + one-time schema setup)
@@ -16,7 +22,8 @@ import psycopg2.pool
 #   beta_employers      - employer registrations (Employer Portal, tab 1)
 #   employer_jobs       - job requisitions        (Employer Portal, tab 2)
 #   candidate_profiles  - candidate profiles      (Employee Portal + Phase 4)
-#   semantic_matches    - Phase 4 match ledger
+#   semantic_matches    - Phase 4 match ledger / 3-Way Push Engine queue
+#   system_telemetry_logs - handled runtime failures (Manual Diagnostic Core Override groundwork)
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS beta_employers (
     id SERIAL PRIMARY KEY,
@@ -33,7 +40,7 @@ CREATE INDEX IF NOT EXISTS idx_beta_employers_admin_email
 CREATE TABLE IF NOT EXISTS candidate_profiles (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255),
-    email VARCHAR(255),
+    contact_email VARCHAR(255),
     role VARCHAR(255),
     resume TEXT,
     address TEXT,
@@ -41,13 +48,15 @@ CREATE TABLE IF NOT EXISTS candidate_profiles (
     latitude FLOAT,
     longitude FLOAT,
     status VARCHAR(50),
+    application_status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 -- Migrations for tables created by older versions of this app
-ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS contact_email VARCHAR(255);
 ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS current_address TEXT;
-CREATE INDEX IF NOT EXISTS idx_candidate_profiles_email
-    ON candidate_profiles (lower(email));
+ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS application_status VARCHAR(32) NOT NULL DEFAULT 'PENDING';
+CREATE INDEX IF NOT EXISTS idx_candidate_profiles_contact_email
+    ON candidate_profiles (lower(contact_email));
 
 CREATE TABLE IF NOT EXISTS employer_jobs (
     id SERIAL PRIMARY KEY,
@@ -57,16 +66,33 @@ CREATE TABLE IF NOT EXISTS employer_jobs (
     address TEXT,
     latitude FLOAT,
     longitude FLOAT,
+    source_channel VARCHAR(64),
+    external_tracking_id VARCHAR(128),
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+-- Attribution metrics for the Multi-Channel Push Architecture
+ALTER TABLE employer_jobs ADD COLUMN IF NOT EXISTS source_channel VARCHAR(64);
+ALTER TABLE employer_jobs ADD COLUMN IF NOT EXISTS external_tracking_id VARCHAR(128);
 
 CREATE TABLE IF NOT EXISTS semantic_matches (
     id SERIAL PRIMARY KEY,
+    candidate_profile_id INTEGER,
     candidate_email VARCHAR(255),
     employer_email VARCHAR(255),
     match_score FLOAT,
     distance_miles FLOAT,
     status VARCHAR(100),
+    payload JSONB,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+ALTER TABLE semantic_matches ADD COLUMN IF NOT EXISTS candidate_profile_id INTEGER;
+ALTER TABLE semantic_matches ADD COLUMN IF NOT EXISTS payload JSONB;
+
+CREATE TABLE IF NOT EXISTS system_telemetry_logs (
+    id SERIAL PRIMARY KEY,
+    diagnostic_error_code VARCHAR(32) NOT NULL,
+    error_context_vector TEXT NOT NULL,
+    error_detail TEXT,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -145,6 +171,51 @@ def get_db_cursor():
         _release_connection(pool, conn)
 
 
+# ==============================================================================
+# 🩺 TRANSPARENT ERROR REPORTING (system_telemetry_logs)
+# ==============================================================================
+# Diagnostic codes for handled runtime failures. Each one is written to the Python
+# log and to system_telemetry_logs, and shown to the user with the matching code.
+DIAGNOSTIC_CODES = {
+    "ICJ-ERR-501": "Candidate duplicate check failed",
+    "ICJ-ERR-502": "Candidate profile save failed",
+    "ICJ-ERR-503": "Candidate target-location geocoding failed",
+    "ICJ-ERR-504": "Employer duplicate check failed",
+    "ICJ-ERR-505": "Employer registration save failed",
+    "ICJ-ERR-506": "Job worksite geocoding failed",
+    "ICJ-ERR-507": "Job requisition save failed",
+    "ICJ-ERR-508": "Employee proximity map query failed",
+    "ICJ-ERR-509": "Manager console candidate read failed",
+    "ICJ-ERR-510": "Manager console match logging failed",
+}
+
+
+def log_system_event(code: str, context: str, exc: BaseException = None) -> None:
+    """Record a handled failure in the Python log and in system_telemetry_logs.
+    Never raises, so reporting an error can't break the request that hit it."""
+    detail = f"{type(exc).__name__}: {exc}"[:2000] if exc else None
+    logger.error("%s [%s] %s", code, context, detail or DIAGNOSTIC_CODES.get(code, ""), exc_info=exc)
+    if isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+        # The database itself is unreachable; skip the telemetry write instead of
+        # making the user wait for a second connection timeout.
+        return
+    try:
+        with get_db_cursor() as cur:
+            cur.execute(
+                "INSERT INTO system_telemetry_logs (diagnostic_error_code, error_context_vector, error_detail) VALUES (%s, %s, %s);",
+                (code, context, detail),
+            )
+    except Exception:
+        logger.exception("Could not write telemetry row for %s [%s]", code, context)
+
+
+def report_failure(code: str, context: str, user_message: str, exc: BaseException = None, level: str = "error") -> None:
+    """Log the failure and show the user a message carrying its diagnostic code."""
+    log_system_event(code, context, exc)
+    show = st.warning if level == "warning" else st.error
+    show(f"{user_message} (Diagnostic code: {code})")
+
+
 # Initialize deep session cache flags to prevent layout resetting loops
 if 'last_ingested_candidate' not in st.session_state:
     st.session_state['last_ingested_candidate'] = None
@@ -184,7 +255,7 @@ class InCityJobsDiagnostics:
                 """, (company, hq, email, phone, signature_hash))
             return True
         except Exception as e:
-            st.error(f"Cloud Storage Write Interrupted: {str(e)}")
+            report_failure("ICJ-ERR-505", "employer_portal.registration.save", "❌ Cloud Storage Write Interrupted: your registration was not saved.", e)
             return False
 
 
@@ -238,10 +309,10 @@ def candidate_profile_ingestion_ui():
         # 3. LEDGER CHECK: is this email already registered in candidate_profiles?
         try:
             with get_db_cursor() as cur:
-                cur.execute("SELECT 1 FROM candidate_profiles WHERE lower(email) = %s LIMIT 1;", (candidate_email,))
+                cur.execute("SELECT 1 FROM candidate_profiles WHERE lower(contact_email) = %s LIMIT 1;", (candidate_email,))
                 duplicate_candidate_found = cur.fetchone() is not None
         except Exception as e:
-            st.error(f"❌ Could not verify existing profiles: {str(e)}")
+            report_failure("ICJ-ERR-501", "employee_portal.intake.duplicate_check", "❌ Could not verify existing profiles, so your profile was not saved. Please try again.", e)
             st.stop()
 
         if duplicate_candidate_found:
@@ -272,15 +343,22 @@ def candidate_profile_ingestion_ui():
                         target_lon = backup_location.longitude
                     else:
                         fallback_triggered = True
-            except Exception:
+            except Exception as geo_err:
+                # Fallback coordinates are used; the user is told below via fallback_triggered
                 fallback_triggered = True
-            
+                log_system_event("ICJ-ERR-503", "employee_portal.intake.geocode", geo_err)
+
             try:
                 with get_db_cursor() as cursor:
                     cursor.execute("""
-                        INSERT INTO candidate_profiles (name, email, role, resume, address, current_address, latitude, longitude, status)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
-                    """, (candidate_name, candidate_email, target_role, resume_text, target_full_addr, current_full_addr, target_lat, target_lon, "active_matching_pool"))
+                        INSERT INTO candidate_profiles (name, contact_email, role, resume, address, current_address, latitude, longitude, status, application_status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id;
+                    """, (candidate_name, candidate_email, target_role, resume_text, target_full_addr, current_full_addr, target_lat, target_lon, "active_matching_pool", "PENDING"))
+                    new_candidate_id = cursor.fetchone()[0]
+
+                # Remember this visitor's own row so the proximity map shows only their data
+                st.session_state['last_ingested_candidate'] = new_candidate_id
 
                 if fallback_triggered:
                     st.warning("ℹ️ **Proximity Mapping Complete:** The system couldn't verify that target street combo. Pinned to regional coordinates.")
@@ -301,13 +379,70 @@ def candidate_profile_ingestion_ui():
                 """, unsafe_allow_html=True)
                 
             except Exception as e:
-                st.error(f"❌ Cloud Connection Blocked: {str(e)}")
+                report_failure("ICJ-ERR-502", "employee_portal.intake.save_profile", "❌ Cloud Connection Blocked: your profile was not saved. Please try again.", e)
 # ==============================================================================
 # 🎛️ NAVIGATION SIDEBAR PANEL CONFIGURATION
 # ==============================================================================
+MAX_MANAGER_LOGIN_ATTEMPTS = 5
+
+
+def _manager_password():
+    """The manager password from Streamlit secrets, or None when it isn't configured
+    (in which case the Manager Console stays disabled for everyone)."""
+    try:
+        return st.secrets.get("admin_password") or None
+    except Exception:
+        # No secrets file at all (e.g. a fresh local checkout): keep the console disabled
+        logger.warning("Streamlit secrets unavailable; Manager Console disabled")
+        return None
+
+
+def render_manager_access_panel():
+    """Sidebar sign-in that gates the Phase 4 Manager Console."""
+    st.session_state.setdefault("is_manager", False)
+    st.session_state.setdefault("manager_failed_attempts", 0)
+
+    with st.sidebar.expander("🔐 Manager Access", expanded=False):
+        expected = _manager_password()
+        if not expected:
+            st.caption("Manager Console is disabled. Add an `admin_password` secret to enable it.")
+            st.session_state["is_manager"] = False
+            return
+
+        if st.session_state["is_manager"]:
+            st.success("Signed in as manager.")
+            if st.button("Sign out", key="manager_sign_out"):
+                st.session_state["is_manager"] = False
+                st.rerun()
+            return
+
+        if st.session_state["manager_failed_attempts"] >= MAX_MANAGER_LOGIN_ATTEMPTS:
+            st.error("Too many failed attempts in this session.")
+            return
+
+        with st.form("manager_login_form", clear_on_submit=True):
+            password = st.text_input("Manager password", type="password")
+            if st.form_submit_button("Sign in"):
+                if hmac.compare_digest(password.encode(), str(expected).encode()):
+                    st.session_state["is_manager"] = True
+                    st.session_state["manager_failed_attempts"] = 0
+                    st.rerun()
+                else:
+                    st.session_state["manager_failed_attempts"] += 1
+                    logger.warning("Failed manager sign-in attempt")
+                    time.sleep(1)  # slow down password guessing
+                    st.error("Incorrect password.")
+
+
 st.sidebar.title("🌍 InCityJobs.us")
 st.sidebar.caption("United States Lower 48 Proximity Network")
-page_selection = st.sidebar.radio("Navigate Portals:", ["Home Portal", "Employer Portal", "Employee Portal"])
+nav_slot = st.sidebar.container()  # keeps navigation above the sign-in panel
+render_manager_access_panel()
+
+portal_options = ["Home Portal", "Employer Portal", "Employee Portal"]
+if st.session_state.get("is_manager"):
+    portal_options.append("Manager Console")
+page_selection = nav_slot.radio("Navigate Portals:", portal_options)
 
 # ==============================================================================
 # 🏠 PAGE BLOCK 1: HOME PORTAL
@@ -369,10 +504,10 @@ elif page_selection == "Employer Portal":
                         duplicate_employer_found = cur.fetchone() is not None
                 except Exception as e:
                     dup_check_failed = True
-                    st.error(f"❌ Could not verify existing registrations: {str(e)}")
+                    report_failure("ICJ-ERR-504", "employer_portal.registration.duplicate_check", "❌ Could not verify existing registrations, so this registration was not saved. Please try again.", e)
 
                 if dup_check_failed:
-                    pass
+                    st.info("No changes were made. Your details are still in the form above.")
                 elif duplicate_employer_found:
                     st.warning("⚠️ **SYSTEM NOTICE: PROFILE REDUNDANCY DETECTED**")
                     st.markdown("**Employer portal:** *Corporate entity footprint already logged and finalized in an earlier organizational ledger row transaction.*")
@@ -427,15 +562,17 @@ elif page_selection == "Employer Portal":
                         loc = geolocator.geocode(f"{site_address}, {site_city}, {site_state} {site_zip}".strip(), timeout=5)
                         if loc:
                             mock_site_lat, mock_site_lon = loc.latitude, loc.longitude
-                    except Exception:
-                        pass
-                        
+                        else:
+                            st.warning("ℹ️ The worksite address could not be matched, so the job was pinned to default regional coordinates.")
+                    except Exception as geo_err:
+                        report_failure("ICJ-ERR-506", "employer_portal.job_requisition.geocode", "⚠️ Worksite address lookup failed, so the job was pinned to default regional coordinates.", geo_err, level="warning")
+
                     try:
                         with get_db_cursor() as cursor:
                             cursor.execute("""
-                                INSERT INTO employer_jobs (title, department, pricing_tier, address, latitude, longitude)
-                                VALUES (%s, %s, %s, %s, %s, %s);
-                            """, (job_title, department_metric, pricing_tier, f"{site_address}, {site_city}, {site_state} {site_zip}".strip(), mock_site_lat, mock_site_lon))
+                                INSERT INTO employer_jobs (title, department, pricing_tier, address, latitude, longitude, source_channel, external_tracking_id)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                            """, (job_title, department_metric, pricing_tier, f"{site_address}, {site_city}, {site_state} {site_zip}".strip(), mock_site_lat, mock_site_lon, "employer_portal", None))
 
                         st.success("🎉 **JOB REQUISITION SYSTEM DEPLOYED LIVE TO NEON CLUSTER!**")
                         st.json({
@@ -446,7 +583,7 @@ elif page_selection == "Employer Portal":
                             "status": "active_seeking_proximity_matches"
                         })
                     except Exception as e:
-                        st.error(f"❌ Database Synchronization Pipeline Failure: {str(e)}")
+                        report_failure("ICJ-ERR-507", "employer_portal.job_requisition.save", "❌ Database Synchronization Pipeline Failure: the job was not published.", e)
     
 
 # ==============================================================================
@@ -461,70 +598,80 @@ elif page_selection == "Employee Portal":
     st.markdown("### 📊 Live Proximity Matching Matrix & Spatial Map")
     st.caption("Step 3.4 & 3.5 — Real-Time Spatial Filtering Array & Native Geospatial Mapping Matrix")
     
-    try:
-        import pandas as pd
-        from geopy.distance import geodesic
+    # PRIVACY: only ever show the profile this visitor submitted in this session
+    my_candidate_id = st.session_state.get('last_ingested_candidate')
+    if my_candidate_id is None:
+        st.info("💡 Complete a profile registration entry above to trigger the automated hyper-local matchmaking array. The map only shows your own submission.")
+    else:
+        try:
+            import pandas as pd
+            from geopy.distance import geodesic
 
-        with get_db_cursor() as cursor:
-            # Fetch the most recently submitted candidate profile
-            cursor.execute("SELECT name, latitude, longitude FROM candidate_profiles ORDER BY id DESC LIMIT 1;")
-            latest_candidate = cursor.fetchone()
+            with get_db_cursor() as cursor:
+                # Fetch this visitor's own candidate profile by its row ID
+                cursor.execute("SELECT name, latitude, longitude FROM candidate_profiles WHERE id = %s;", (my_candidate_id,))
+                latest_candidate = cursor.fetchone()
 
-            # Pull all active job listings from the employer database table
-            cursor.execute("SELECT title, department, pricing_tier, address, latitude, longitude FROM employer_jobs;")
-            active_jobs = cursor.fetchall()
+                # Pull all active job listings from the employer database table
+                cursor.execute("SELECT title, department, pricing_tier, address, latitude, longitude FROM employer_jobs;")
+                active_jobs = cursor.fetchall()
 
-        if latest_candidate and active_jobs:
-            cand_name, cand_lat, cand_lon = latest_candidate
-            cand_coords = (cand_lat, cand_lon)
+            if latest_candidate is None:
+                st.session_state['last_ingested_candidate'] = None
+                st.info("💡 Your earlier profile could not be found. Please submit the form above again.")
+            elif not active_jobs:
+                st.info("💡 Your profile is saved. No job openings have been posted yet, so there is nothing to match against.")
+            else:
+                cand_name, cand_lat, cand_lon = latest_candidate
+                cand_coords = (cand_lat, cand_lon)
             
-            st.info(f"Scanning target job footprints for candidate **{cand_name}** centered at target coordinates: `{cand_coords}`")
+                st.info(f"Scanning target job footprints for candidate **{cand_name}** centered at target coordinates: `{cand_coords}`")
             
-            # Create a simple mapping coordinates collection array
-            map_data = []
-            # Instantly seed the candidate's personal target location spot into the map tracking array
-            map_data.append({"latitude": cand_lat, "longitude": cand_lon, "name": f"Candidate: {cand_name}"})
+                # Create a simple mapping coordinates collection array
+                map_data = []
+                # Instantly seed the candidate's personal target location spot into the map tracking array
+                map_data.append({"latitude": cand_lat, "longitude": cand_lon, "name": f"Candidate: {cand_name}"})
             
-            match_found = False
-            for job in active_jobs:
-                j_title, j_dept, j_price, j_addr, j_lat, j_lon = job
-                job_coords = (j_lat, j_lon)
+                match_found = False
+                for job in active_jobs:
+                    j_title, j_dept, j_price, j_addr, j_lat, j_lon = job
+                    if j_lat is None or j_lon is None:
+                        continue  # job without coordinates can't be distance-matched
+                    job_coords = (j_lat, j_lon)
                 
-                # Compute exact geographical mileage distance
-                distance_miles = geodesic(cand_coords, job_coords).miles
+                    # Compute exact geographical mileage distance
+                    distance_miles = geodesic(cand_coords, job_coords).miles
                 
-                # Dynamic matching threshold rule (25-mile operational boundaries)
-                if distance_miles <= 25:
-                    match_found = True
-                    # Append matching job coordinates to our layout map tracking list
-                    map_data.append({"latitude": j_lat, "longitude": j_lon, "name": f"Job: {j_title}"})
+                    # Dynamic matching threshold rule (25-mile operational boundaries)
+                    if distance_miles <= 25:
+                        match_found = True
+                        # Append matching job coordinates to our layout map tracking list
+                        map_data.append({"latitude": j_lat, "longitude": j_lon, "name": f"Job: {j_title}"})
                     
-                    with st.expander(f"✨ MATCH FOUND: {j_title} ({j_dept}) — {round(distance_miles, 1)} Miles Away", expanded=True):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.write(f"**Worksite Location:** {j_addr}")
-                            st.write(f"**Distance Allocation:** {round(distance_miles, 2)} active miles.")
-                        with col2:
-                            st.metric(label="System Billing Value", value=str(j_price))
-                            st.success("🎯 Match Status: High Proximity Verified")
+                        with st.expander(f"✨ MATCH FOUND: {j_title} ({j_dept}) — {round(distance_miles, 1)} Miles Away", expanded=True):
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.write(f"**Worksite Location:** {j_addr}")
+                                st.write(f"**Distance Allocation:** {round(distance_miles, 2)} active miles.")
+                            with col2:
+                                st.metric(label="System Billing Value", value=str(j_price))
+                                st.success("🎯 Match Status: High Proximity Verified")
                         
                         
             
-            # 🔥 STEP 3.5 VISUALIZATION LAYOUT: Render the interactive geospatial dot map canvas
-            if map_data:
-                st.markdown("#### 🗺️ Interactive Proximity Footprint Radar")
-                df_map = pd.DataFrame(map_data)
-                # Native mapping widget calls zero compilation libraries and loads instantly
-                st.map(df_map, zoom=11, use_container_width=True)
-                st.caption("Visual Legend: The interactive radar display plots your target profile center point relative to matching regional workplace openings.")
-            
-            if not match_found:
-                st.warning("🔍 Active scan complete: No vacancies currently found within a 25-mile boundary radius of your target deployment location.")
-        else:
-            st.info("💡 Complete a profile registration entry above to trigger the automated hyper-local matchmaking array.")
-            
-    except Exception as e:
-        st.error(f"⚠️ Spatial Match Engine Query Interrupted: {str(e)}")
+                # 🔥 STEP 3.5 VISUALIZATION LAYOUT: Render the interactive geospatial dot map canvas
+                if map_data:
+                    st.markdown("#### 🗺️ Interactive Proximity Footprint Radar")
+                    df_map = pd.DataFrame(map_data)
+                    # Native mapping widget calls zero compilation libraries and loads instantly
+                    st.map(df_map, zoom=11, width="stretch")
+                    st.caption("Visual Legend: The interactive radar display plots your target profile center point relative to matching regional workplace openings.")
+
+                if not match_found:
+                    st.warning("🔍 Active scan complete: No vacancies currently found within a 25-mile boundary radius of your target deployment location.")
+
+        except Exception as e:
+            report_failure("ICJ-ERR-508", "employee_portal.proximity_map.query", "⚠️ Spatial Match Engine Query Interrupted: your job matches could not be loaded.", e)
 class Phase4SemanticEngine:
     """Pillars 4.1, 4.2 & 4.3: Local Natural Language Parsing & Cosine Math Matrix."""
 
@@ -564,7 +711,8 @@ class Phase4SemanticEngine:
         # Assemble coordinates dynamically
         vocabulary = sorted(list(set(res_tokens + job_tokens)))
         if not vocabulary:
-            return {"composite": 0.0, "semantic": 0.0, "skills": []}
+            # Same keys as the normal result so callers never hit a KeyError
+            return {"semantic_percentage": 0.0, "matched_skills": []}
 
         # Mathematical feature coordinates
         res_vec = [float(res_tokens.count(word)) for word in vocabulary]
@@ -584,7 +732,12 @@ class Phase4SemanticEngine:
 
 
 def ai_contextual_matching_dashboard():
-    """Renders the final visual matrix workspace comparing jobs vs candidates."""
+    """Renders the final visual matrix workspace comparing jobs vs candidates.
+    Managers only: it shows candidate names, emails and scores."""
+    if not st.session_state.get("is_manager"):
+        st.error("🔒 Manager sign-in required.")
+        return
+
     from geopy.distance import geodesic  # Ensure geopy is utilized for precise radius gates
 
     st.markdown("---")
@@ -610,14 +763,14 @@ def ai_contextual_matching_dashboard():
             with get_db_cursor() as cursor:
                 # Read the same production table the Employee Portal writes to
                 cursor.execute("""
-                    SELECT name, role, resume, email, latitude, longitude
+                    SELECT id, name, role, resume, contact_email, latitude, longitude
                     FROM candidate_profiles
-                    WHERE email IS NOT NULL AND email <> ''
+                    WHERE contact_email IS NOT NULL AND contact_email <> ''
                     ORDER BY id DESC LIMIT 5;
                 """)
                 records = cursor.fetchall()
         except Exception as e:
-            st.error(f"Failed to access verification matrix records: {str(e)}")
+            report_failure("ICJ-ERR-509", "manager_console.phase4.read_candidates", "❌ Failed to access verification matrix records.", e)
             return
 
         if not records:
@@ -628,7 +781,7 @@ def ai_contextual_matching_dashboard():
         employer_email = "recruiter@mycityjobs.us"  # Production recruiter communication endpoint node
 
         st.markdown("### 📊 Live AI Scan Execution Metrics")
-        for name, role, resume, email, c_lat, c_lon in records:
+        for cand_id, name, role, resume, email, c_lat, c_lon in records:
 
             # A. Run AI Contextual Text Parsing and Vector Math
             analysis = ai_engine.calculate_match(resume, sandbox_job_requirement)
@@ -647,7 +800,7 @@ def ai_contextual_matching_dashboard():
             ai_match_verified = is_geo_valid and is_semantic_valid and email
 
             # Visual rendering container card based on AI processing decision
-            status_emoji = "✅ AUTONOMOUSLY PUSHED" if ai_match_verified else "❌ GATED (Sub-optimal Match)"
+            status_emoji = "✅ MATCH LOGGED" if ai_match_verified else "❌ GATED (Sub-optimal Match)"
 
             with st.expander(f"👤 Candidate: {name} — Strategy: {status_emoji}"):
                 col1, col2, col3 = st.columns(3)
@@ -671,41 +824,67 @@ def ai_contextual_matching_dashboard():
 
                 # 🚀 AUTOMATIC SELF-TRIGGER ACTIVATION NODE (only for verified matches)
                 else:
-                    st.success("⚡ **AI VERIFICATION PASSED:** Initializing automatic dual-routing connections...")
+                    st.success("⚡ **AI VERIFICATION PASSED:** Logging match payload for the 3-Way Candidate Push Engine...")
+
+                    # Everything the upcoming push engine will need to notify both sides.
+                    # Nothing is sent yet: the mail gateway is not connected.
+                    match_payload = {
+                        "engine": "3-way-candidate-push",
+                        "delivery_status": "NOT_SENT_GATEWAY_PENDING",
+                        "push_targets": ["candidate", "employer", "platform_ledger"],
+                        "candidate": {
+                            "profile_id": cand_id,
+                            "name": name,
+                            "contact_email": email,
+                            "target_role": role,
+                        },
+                        "employer": {
+                            "contact_email": employer_email,
+                            "worksite_coordinates": [employer_lat, employer_lon],
+                        },
+                        "job_requirements": sandbox_job_requirement,
+                        "scores": {
+                            "semantic_percentage": semantic_pct,
+                            "matched_skills": sorted(analysis['matched_skills']),
+                            "distance_miles": distance_miles,
+                            "max_radius_miles": max_allowed_radius,
+                        },
+                        "logged_at": datetime.now(timezone.utc).isoformat(),
+                    }
+
                     try:
                         with get_db_cursor() as cursor:
-                            # Skip pairs that were already pushed to prevent duplicates
+                            # One ledger row per candidate/employer pair (older rows count too)
                             cursor.execute("""
                                 SELECT 1 FROM semantic_matches
-                                WHERE candidate_email = %s AND employer_email = %s AND status = 'autonomous_pushed_dual'
+                                WHERE lower(candidate_email) = lower(%s) AND employer_email = %s
                                 LIMIT 1;
                             """, (email, employer_email))
-                            already_pushed = cursor.fetchone() is not None
+                            already_logged = cursor.fetchone() is not None
 
-                            if not already_pushed:
+                            if not already_logged:
                                 cursor.execute("""
-                                    INSERT INTO semantic_matches (candidate_email, employer_email, match_score, distance_miles, status)
-                                    VALUES (%s, %s, %s, %s, %s);
-                                """, (email, employer_email, semantic_pct, distance_miles, "autonomous_pushed_dual"))
+                                    INSERT INTO semantic_matches (candidate_profile_id, candidate_email, employer_email, match_score, distance_miles, status, payload)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb);
+                                """, (cand_id, email, employer_email, semantic_pct, distance_miles, "QUEUED_PENDING_GATEWAY", json.dumps(match_payload)))
 
-                        if not already_pushed:
-                            st.toast(f"Autonomous connection locked for {name}!")
-                            st.balloons()
-                            st.info(f"📬 [AI AUTO-PUSH 1 -> CANDIDATE]: Position metrics securely sent to **{email}**.")
-                            st.info(f"📬 [AI AUTO-PUSH 2 -> EMPLOYER]: Candidate resume securely sent to **{employer_email}**.")
+                        if not already_logged:
+                            st.toast(f"Match logged for {name}")
+                            st.info("📝 Match payload logged to the `semantic_matches` ledger for the upcoming 3-Way Candidate Push Engine. **No notifications were sent** — the mail gateway is not connected yet.")
                         else:
-                            st.warning("ℹ️ Profile already verified and processed in an earlier scanning ledger row transaction.")
+                            st.warning("ℹ️ This candidate/employer pair is already in the match ledger.")
 
-                    except Exception as auto_push_err:
-                        st.error(f"AI self-trigger database transaction write failed: {str(auto_push_err)}")
+                    except Exception as log_err:
+                        report_failure("ICJ-ERR-510", "manager_console.phase4.log_match", "❌ The match could not be logged.", log_err)
 
-# Master entry node execution call (PERFECT PORTAL ISOLATION)
-if __name__ == "__main__":
-    
-    # Check your exact sidebar variable 'page_selection'
-    # If the user is on the Home Portal, skip it entirely. Only render on Employee/Employer sub-menus!
-    if 'page_selection' in locals() and page_selection in ["Employer Portal", "Employee Portal"]:
-        ai_contextual_matching_dashboard()
+# ==============================================================================
+# 🧠 PAGE BLOCK 4: MANAGER CONSOLE (Phase 4, managers only)
+# ==============================================================================
+# Rendered here, after the functions it uses are defined. The page only appears in
+# the navigation after a manager signs in, and the dashboard re-checks the role.
+if page_selection == "Manager Console":
+    st.title("🧠 Manager Console")
+    ai_contextual_matching_dashboard()
 
 
 
