@@ -18,7 +18,8 @@ The final commit ID is reported with the review submission (this file is part of
 | `c20a682` | Consent and append-only audit foundation |
 | `5501ddd` | Recommendation backend: generation, statuses, anonymization, concurrency |
 | `5ab72c5` | Employer Recommended Candidates dashboard with strict isolation |
-| *(latest)* | Matching engine assessment across occupations (engine unchanged) |
+| `eb7fb46` | Matching engine assessment across occupations (engine unchanged) |
+| *(latest)* | Review documents only: staging verification checklist, matching-improvement recommendations, remaining Employer Module requirements |
 
 ## Review requirements → changes
 | # | Requirement | Change | Files |
@@ -40,6 +41,11 @@ The final commit ID is reported with the review submission (this file is part of
 - **Audit:** an append-only `privacy_audit_log` records consent, visibility, views, denied attempts and withdrawals. The database rejects UPDATE, DELETE and TRUNCATE on it.
 - **Ledger:** new `semantic_matches` payloads reference candidates by id only.
 - **Matching engine:** unchanged. Its weaknesses are documented with reproducible evidence in `docs/MATCHING_ENGINE_ASSESSMENT.md`. Realistic one-page resumes score 6.5–37% against the 50% threshold, so recommendations will be rare until the engine is extended.
+
+## Review documents
+- `docs/STAGING_VERIFICATION_CHECKLIST.md`: live staging checks with sign-off table
+- `docs/MATCHING_ENGINE_ASSESSMENT.md`: realistic-resume limitation and recommendations R1–R6
+- `docs/EMPLOYER_MODULE_REMAINING_REQUIREMENTS.md`: payments, billing, interview calendar, communication rooms, copy fixes K1–K3, decisions D1–D7
 
 ## Startup diagnostics (follow-up from the staging incident)
 On staging, a wrong database password was reported as ICJ-ERR-504, the employer duplicate-check code. Errors are now classified by the operation that failed (`diagnostics.py`):

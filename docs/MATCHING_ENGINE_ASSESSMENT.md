@@ -60,8 +60,48 @@ Once the Candidate Module accepts uploaded resumes (typically 300–800 words), 
 - Profiles show qualifications only for tech roles (W3), and can show a misleading one for welders (W4).
 - No change is made in this phase.
 
-## Options for a future extension (not implemented; each needs approval and re-assessment)
-1. **Requirement-coverage scoring:** the share of the job's requirements found in the resume. This removes the length penalty (W1) and W6.
-2. **Occupation dictionaries with synonyms and abbreviations** (CDL / commercial driver's license, BLS / Basic Life Support, MIG / GMAW), plus sense disambiguation for terms like "AWS" (W2–W4).
-3. **Leave the department label out of the scored text**, or weight it lightly (W5).
-4. **Keep this labelled set as the acceptance test,** and extend it with real, anonymised resumes once the Candidate Module collects them with consent.
+## Recommendations for improving accuracy across occupations
+Not implemented. Each step needs approval, and must be re-assessed against the labelled set before it's enabled.
+
+### R1. Score requirement coverage, not whole-document similarity (fixes W1 and W6)
+- Turn each job's requirements into a list of items. Split on commas and semicolons, and let employers mark items as **must-have** or **nice-to-have** (a small change to the job form).
+- Score = weighted share of requirement items found in the resume. Must-haves gate the match; nice-to-haves rank it.
+- Resume length then no longer matters. Extra experience can't lower a score; only missing requirements can.
+- Keep the existing gates unchanged: contact email, known locations, fallback exclusion and radius.
+
+### R2. Occupation-aware skills and credentials dictionary (fixes W2, W3 and W4)
+- Replace the 11 tech terms with a maintained dictionary grouped by occupation family: tech, logistics and warehouse, transportation, healthcare, retail, skilled trades, office.
+- Each entry has its **synonyms and abbreviations**. Examples:
+  - `CDL` = commercial driver's license, Class A
+  - `BLS` = Basic Life Support
+  - `MIG` = GMAW
+  - `POS` = point of sale
+  - `EHR` = Epic or Cerner
+- Detect **credentials with patterns** (e.g. `AWS D1.1`, `OSHA 10/30`, `Class A`, `RN license`). Resolve ambiguous terms by context: `AWS` next to `D1.1` or welding words means the American Welding Society, not the cloud.
+- Consider aligning to a public occupation and skills taxonomy (such as O*NET or ESCO) so the vocabulary stays maintained.
+- Privacy benefit: employer profiles can then show non-tech qualifications (e.g. "Forklift certification, OSHA 10"). Because these are dictionary labels, they stay safe to show. Free text is still never shown.
+
+### R3. Normalise text before matching
+- Handle plurals and stems, numbers ("2+ years", "two years") and phrase matching ("point of sale").
+- Leave the department label out of the scored text, or give it a small weight (fixes W5).
+
+### R4. Calibrate per occupation family, with evidence
+- Grow the labelled set: more occupations, and several resumes per type including borderline cases.
+- Once the Candidate Module collects them with consent, add real anonymised resumes.
+- Track precision and recall for each occupation family. Choose thresholds per family rather than one global 50%.
+- Acceptance criteria before enabling a new engine:
+  - ≥ 90% of realistic qualified resumes match
+  - ≤ 5% of unqualified resumes match
+  - no occupation family below 80% recall
+  - `tests/test_units.py` pins updated together with this document.
+
+### R5. Run the new engine alongside the old before switching
+- Compute the new score next to the old one without showing it to employers. Compare results on the staging data.
+- Switch only after review. Store the engine version on each recommendation, so changing engines re-surfaces items exactly once (the fingerprint mechanism already supports this).
+
+### R6. Optional, later: semantic embeddings
+- A sentence-embedding model can catch paraphrases beyond the dictionary.
+- It adds a model dependency, cost and explainability questions. Use it only as a ranking signal on top of R1 and R2, never as the only gate.
+- Any external AI service would need a privacy review, because resume text would leave the platform.
+
+**Suggested order:** R3 and R2 (dictionary first) → R1 → R4 calibration → R5 shadow comparison. R1 and R2 together address the 0/7 realistic-resume result. R4 and R5 are what make it safe to switch.
