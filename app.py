@@ -25,6 +25,12 @@ from diagnostics import (
     install_redacting_filter,
     redact,
 )
+from recommendations import (
+    CONSENT_FOOTNOTE,
+    CONSENT_LABEL,
+    consent_state,
+    set_matching_consent,
+)
 from matching import (
     CandidateRecord,
     JobCriteria,
@@ -431,6 +437,10 @@ def candidate_profile_ingestion_ui():
         with col_t3:
             t_zip = st.text_input("Target Zip Code", placeholder="35603")
 
+        st.markdown("### 🛡️ 4. Employer Matching Consent (optional)")
+        matching_consent = st.checkbox(CONSENT_LABEL, value=False, key="candidate_matching_consent")
+        st.caption(CONSENT_FOOTNOTE)
+
         submit_button = st.form_submit_button(label="Lock Profile & Validate Location Paths")
 
     if not submit_button:
@@ -485,6 +495,9 @@ def candidate_profile_ingestion_ui():
                 RETURNING id;
             """, (candidate_name, candidate_email, target_role, resume_text, target_full_addr, current_full_addr, target_lat, target_lon, "active_matching_pool", "PENDING"))
             new_candidate_id = cursor.fetchone()[0]
+            # Consent columns default to FALSE; only an explicit opt-in grants it (and is audited)
+            if matching_consent:
+                set_matching_consent(cursor, new_candidate_id, True, "candidate", "intake_form")
     except Exception as e:
         if db_schema.is_unique_violation(e):
             _show_candidate_duplicate_notice()
@@ -495,6 +508,10 @@ def candidate_profile_ingestion_ui():
     # Remember this visitor's own row so the proximity map shows only their data
     st.session_state['last_ingested_candidate'] = new_candidate_id
     st.success("🎉 **DYNAMIC DUAL-LOCATION INGESTION COMPLETED SUCCESSFULLY!**")
+    if matching_consent:
+        st.info("🛡️ **Employer matching: ON.** Verified employers with matching openings may see your anonymized profile. You can withdraw below.")
+    else:
+        st.info("🛡️ **Employer matching: OFF.** Employers will not see your profile. You can opt in below.")
 
     safe = html.escape  # user input is placed inside HTML below
     st.markdown(f"""
@@ -514,6 +531,43 @@ def candidate_profile_ingestion_ui():
 def _show_candidate_duplicate_notice():
     st.warning("⚠️ **SYSTEM NOTICE: TALENT MATRIX REDUNDANCY**")
     st.markdown("**Employee portal:** *Profile already verified and processed in an earlier scanning ledger row transaction.*")
+
+
+def change_candidate_consent(candidate_id: int, granted: bool, actor_type: str, actor_ref: str, context: str) -> bool:
+    """Grant or withdraw employer-matching consent (audited). Returns True on success."""
+    try:
+        with get_db_cursor() as cur:
+            set_matching_consent(cur, candidate_id, granted, actor_type, actor_ref)
+    except Exception as e:
+        report_failure("ICJ-ERR-521", context, "❌ Your consent choice could not be saved. Nothing was changed. Please try again.", e)
+        return False
+    return True
+
+
+def render_own_consent_controls(candidate_id: int):
+    """Consent controls for the profile submitted in THIS browser session only."""
+    st.markdown("### 🛡️ Your Employer Matching Consent")
+    try:
+        with get_db_cursor() as cur:
+            state = consent_state(cur, candidate_id)
+    except Exception as e:
+        report_failure("ICJ-ERR-521", "employee_portal.consent.load", "❌ Your consent status could not be loaded.", e)
+        return
+    if state is None:
+        return
+    consented, changed_at, policy = state
+    if consented:
+        st.success(f"Employer matching is **ON** (policy {policy}). Verified employers with matching openings may see your anonymized profile.")
+        if st.button("Withdraw consent", key="withdraw_own_consent"):
+            if change_candidate_consent(candidate_id, False, "candidate", "own_session", "employee_portal.consent.withdraw"):
+                st.rerun()
+    else:
+        st.info("Employer matching is **OFF**. Employers do not see your profile.")
+        st.caption(CONSENT_LABEL)
+        st.caption(CONSENT_FOOTNOTE)
+        if st.button("I agree: turn on anonymized employer matching", key="grant_own_consent"):
+            if change_candidate_consent(candidate_id, True, "candidate", "own_session", "employee_portal.consent.grant"):
+                st.rerun()
 
 
 # ==============================================================================
@@ -943,8 +997,8 @@ def manager_console():
         st.error("🔒 Manager sign-in required.")
         return
     st.caption(f"Signed in as manager **{manager}**.")
-    tab_live, tab_sim, tab_access, tab_checks = st.tabs(
-        ["🎯 Live Job Matching", "🧪 Simulation Sandbox", "🔑 Employer Access", "🩺 System Checks"]
+    tab_live, tab_sim, tab_access, tab_consent, tab_checks = st.tabs(
+        ["🎯 Live Job Matching", "🧪 Simulation Sandbox", "🔑 Employer Access", "🛡️ Consent & Audit", "🩺 System Checks"]
     )
     with tab_live:
         live_matching_tab()
@@ -952,8 +1006,70 @@ def manager_console():
         simulation_tab()
     with tab_access:
         employer_access_tab()
+    with tab_consent:
+        consent_audit_tab(manager)
     with tab_checks:
         system_checks_tab()
+
+
+AUDIT_DISPLAY_LIMIT = 100
+
+
+def consent_audit_tab(manager: str):
+    """Record a candidate-requested consent withdrawal, and show the append-only audit trail."""
+    st.markdown("### 🛡️ Candidate Consent")
+    st.caption("Use this only when a candidate asks to withdraw employer-matching consent. "
+               "Managers can withdraw consent but cannot grant it on a candidate's behalf.")
+    with st.form("manager_consent_lookup", clear_on_submit=False):
+        lookup_email = st.text_input("Candidate email (exact)", key="consent_lookup_email")
+        looked_up = st.form_submit_button("Look up consent status")
+    candidate_id = st.session_state.get("consent_lookup_candidate")
+    if looked_up:
+        candidate_id = None
+        try:
+            with get_db_cursor() as cur:
+                cur.execute("SELECT id FROM candidate_profiles WHERE lower(btrim(contact_email)) = %s ORDER BY id LIMIT 1;",
+                            ((lookup_email or "").strip().lower(),))
+                row = cur.fetchone()
+        except Exception as e:
+            report_failure("ICJ-ERR-521", "manager_console.consent.lookup", "❌ The lookup failed.", e)
+            row = None
+        candidate_id = row[0] if row else None
+        st.session_state["consent_lookup_candidate"] = candidate_id
+        if row is None:
+            st.info("No candidate with that email.")
+    if candidate_id:
+        try:
+            with get_db_cursor() as cur:
+                state = consent_state(cur, candidate_id)
+        except Exception as e:
+            report_failure("ICJ-ERR-521", "manager_console.consent.state", "❌ The consent status could not be loaded.", e)
+            state = None
+        if state:
+            consented, changed_at, policy = state
+            st.write(f"Candidate #{candidate_id}: employer matching **{'ON' if consented else 'OFF'}**"
+                     f"{f' (policy {policy}, since {changed_at})' if consented else ''}")
+            if consented and st.button("Record consent withdrawal requested by the candidate", key="manager_withdraw_consent"):
+                if change_candidate_consent(candidate_id, False, "manager", manager, "manager_console.consent.withdraw"):
+                    st.success("Consent withdrawn and recorded in the audit log.")
+
+    st.markdown("### 📜 Privacy Audit Log (append-only)")
+    try:
+        with get_db_cursor() as cur:
+            cur.execute("""
+                SELECT id, created_at, event_type, actor_type, actor_ref, candidate_profile_id, employer_id, job_id, recommendation_id
+                FROM privacy_audit_log ORDER BY id DESC LIMIT %s;
+            """, (AUDIT_DISPLAY_LIMIT,))
+            events = cur.fetchall()
+    except Exception as e:
+        report_failure("ICJ-ERR-521", "manager_console.audit.load", "❌ The audit log could not be loaded.", e)
+        return
+    if not events:
+        st.info("No audit events yet.")
+        return
+    st.dataframe([{"#": e[0], "When": str(e[1]), "Event": e[2], "Actor": f"{e[3]}:{e[4] or ''}", "Candidate": e[5],
+                   "Employer": e[6], "Job": e[7], "Recommendation": e[8]} for e in events], width="stretch")
+    st.caption(f"Most recent {AUDIT_DISPLAY_LIMIT} events. Rows can't be edited or deleted.")
 
 
 # ==============================================================================
@@ -1150,6 +1266,11 @@ elif page_selection == "Employee Portal":
     st.title("👥 Employee Access Portal")
     st.subheader(f"Localized Talent Onboarding Verification Node ({region_meta['region']})")
     candidate_profile_ingestion_ui()
+
+    # Consent controls only for the profile submitted in this browser session
+    if st.session_state.get('last_ingested_candidate') is not None:
+        st.write("---")
+        render_own_consent_controls(st.session_state['last_ingested_candidate'])
 
     st.write("---")
     st.markdown("### 📊 Live Proximity Matching Matrix & Spatial Map")

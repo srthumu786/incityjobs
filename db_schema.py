@@ -111,6 +111,73 @@ CREATE TABLE IF NOT EXISTS system_telemetry_logs (
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Candidate consent (docs/EMPLOYER_RECOMMENDATIONS_PLAN.md). Every new field
+-- defaults to NO authorization, so existing candidates are not shown to employers.
+ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS employer_matching_consent BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS employer_matching_consent_at TIMESTAMPTZ;
+ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS employer_matching_consent_policy VARCHAR(64);
+ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS contact_disclosure_consent BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS resume_version INTEGER NOT NULL DEFAULT 1;
+
+-- Employer-facing recommendations: one row per (job, candidate). DELIVERED is
+-- reserved for a future messaging integration and deliberately not allowed yet.
+CREATE TABLE IF NOT EXISTS employer_recommendations (
+    id BIGSERIAL PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES employer_jobs(id) ON DELETE CASCADE,
+    employer_id INTEGER NOT NULL REFERENCES beta_employers(id) ON DELETE CASCADE,
+    candidate_profile_id INTEGER NOT NULL REFERENCES candidate_profiles(id) ON DELETE CASCADE,
+    status VARCHAR(16) NOT NULL CHECK (status IN ('QUEUED', 'AVAILABLE', 'VIEWED', 'WITHDRAWN')),
+    status_reason VARCHAR(64),
+    employer_ref VARCHAR(16) NOT NULL UNIQUE,
+    profile JSONB NOT NULL,
+    fingerprint CHAR(64) NOT NULL,
+    notified_fingerprint CHAR(64),
+    viewed_fingerprint CHAR(64),
+    is_new BOOLEAN NOT NULL DEFAULT FALSE,
+    score REAL,
+    distance_miles REAL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    available_at TIMESTAMPTZ,
+    viewed_at TIMESTAMPTZ,
+    withdrawn_at TIMESTAMPTZ,
+    UNIQUE (job_id, candidate_profile_id)
+);
+CREATE INDEX IF NOT EXISTS idx_employer_recommendations_employer_status
+    ON employer_recommendations (employer_id, status);
+CREATE INDEX IF NOT EXISTS idx_employer_recommendations_candidate
+    ON employer_recommendations (candidate_profile_id);
+
+-- Append-only audit of consent, recommendation visibility, profile views and
+-- withdrawals. Ids and non-personal detail only. UPDATE/DELETE/TRUNCATE are
+-- rejected by triggers (PostgreSQL 14+).
+CREATE TABLE IF NOT EXISTS privacy_audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    event_type VARCHAR(40) NOT NULL,
+    actor_type VARCHAR(16) NOT NULL CHECK (actor_type IN ('system', 'candidate', 'employer', 'manager')),
+    actor_ref VARCHAR(64),
+    candidate_profile_id INTEGER,
+    employer_id INTEGER,
+    job_id INTEGER,
+    recommendation_id BIGINT,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_privacy_audit_log_candidate ON privacy_audit_log (candidate_profile_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_privacy_audit_log_recommendation ON privacy_audit_log (recommendation_id);
+CREATE OR REPLACE FUNCTION incity_reject_audit_change() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'privacy_audit_log is append-only' USING ERRCODE = 'insufficient_privilege';
+END;
+$$;
+CREATE OR REPLACE TRIGGER privacy_audit_log_append_only
+    BEFORE UPDATE OR DELETE ON privacy_audit_log
+    FOR EACH ROW EXECUTE FUNCTION incity_reject_audit_change();
+CREATE OR REPLACE TRIGGER privacy_audit_log_no_truncate
+    BEFORE TRUNCATE ON privacy_audit_log
+    FOR EACH STATEMENT EXECUTE FUNCTION incity_reject_audit_change();
+
 -- Non-unique email indexes from earlier revisions of this branch are replaced by
 -- the UNIQUE ones below.
 DROP INDEX IF EXISTS idx_beta_employers_admin_email;

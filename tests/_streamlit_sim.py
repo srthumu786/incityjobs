@@ -85,7 +85,7 @@ class UI:
     def container(self): return _Ctx(self)
     def text_input(self, label, key=None, **k): return self.inputs.get(key or label, "")
     def text_area(self, label, value="", **k): return self.inputs.get(label, value)
-    def checkbox(self, label, **k): return self.inputs.get(label, False)
+    def checkbox(self, label, key=None, value=False, **k): return self.inputs.get(key, self.inputs.get(label, value)) if key else self.inputs.get(label, value)
     def selectbox(self, label, options, **k):
         want = self.inputs.get(label)
         return next((o for o in options if want and o.startswith(want)), options[0])

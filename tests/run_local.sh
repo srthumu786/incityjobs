@@ -61,7 +61,7 @@ export PYTHONPATH="$TESTS/pg_adapter:$TESTS"
 unset INCITY_DB_URL
 
 status=0
-for suite in test_units.py test_migration.py test_e2e.py test_diagnostics.py; do
+for suite in test_units.py test_migration.py test_e2e.py test_diagnostics.py test_recommendations.py; do
   echo; echo "=== $suite ==="
   python3 "$TESTS/$suite" 2> "$WORK/$suite.stderr" || { status=1; echo "--- $suite stderr (last 20 lines) ---"; tail -20 "$WORK/$suite.stderr"; }
 done

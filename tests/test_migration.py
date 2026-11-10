@@ -97,6 +97,28 @@ c.ok("data", sql(DB, "SELECT string_agg(DISTINCT application_status, ',') FROM c
      and sql(DB, "SELECT string_agg(DISTINCT match_radius_miles::text, ',') FROM employer_jobs") == "25",
      "new columns get defaults (application_status PENDING, radius 25) without touching original values")
 
+c.ok("data", sql(DB, "SELECT count(*) FROM candidate_profiles WHERE employer_matching_consent OR contact_disclosure_consent "
+                     "OR employer_matching_consent_at IS NOT NULL OR employer_matching_consent_policy IS NOT NULL") == "0"
+     and sql(DB, "SELECT string_agg(DISTINCT resume_version::text, ',') FROM candidate_profiles") == "1",
+     "existing candidates get NO consent (matching and contact disclosure FALSE, no timestamp/policy), resume_version 1")
+c.ok("data", sql(DB, "SELECT count(*) FROM employer_recommendations") == "0", "no recommendations are created by the migration itself")
+
+# Append-only audit log and reserved statuses are enforced by the database, not just the app
+sql(DB, "INSERT INTO privacy_audit_log (event_type, actor_type) VALUES ('TEST_EVENT', 'system');")
+def rejected(statement):
+    r = subprocess.run(["psql", "-X", "-q", "-At", "-h", os.environ["PGSHIM_HOST"], "-p", os.environ.get("PGSHIM_PORT", "5432"),
+                        "-U", os.environ.get("PGSHIM_USER", "postgres"), "-d", DB, "-c", statement], capture_output=True, text=True)
+    return r.returncode != 0, r.stderr.strip()
+for label, statement in {"UPDATE": "UPDATE privacy_audit_log SET event_type = 'TAMPERED';",
+                         "DELETE": "DELETE FROM privacy_audit_log;",
+                         "TRUNCATE": "TRUNCATE privacy_audit_log;"}.items():
+    blocked, err = rejected(statement)
+    c.ok("security", blocked and "append-only" in err, f"privacy_audit_log rejects {label} (append-only trigger)", err)
+c.ok("security", sql(DB, "SELECT count(*) || ':' || min(event_type) FROM privacy_audit_log") == "1:TEST_EVENT", "audit row intact after tamper attempts")
+blocked, err = rejected("INSERT INTO employer_recommendations (job_id, employer_id, candidate_profile_id, status, employer_ref, profile, fingerprint) "
+                        "VALUES (1, 1, 1, 'DELIVERED', 'C-TEST', '{}', repeat('0', 64));")
+c.ok("security", blocked and "status_check" in err, "status DELIVERED is reserved: rejected by the CHECK constraint", err)
+
 r = run_check("--apply")
 c.ok("data", r.returncode == 1 and "MIGRATION NOT COMPLETE" in r.stdout, "check_migration --apply refuses to declare completion with duplicates present", r.stdout)
 

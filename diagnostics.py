@@ -41,6 +41,9 @@ DIAGNOSTIC_CODES = {
     "ICJ-ERR-516": "Manager console system checks failed",
     "ICJ-ERR-517": "Employer account verification failed",
     "ICJ-ERR-518": "UNIQUE email constraint not verified active (e.g. existing duplicates); app-level checks remain on",
+    "ICJ-ERR-519": "Recommendation generation failed (the triggering action itself was saved)",
+    "ICJ-ERR-520": "Recommended Candidates could not be loaded or opened",
+    "ICJ-ERR-521": "Candidate consent update failed",
 }
 
 
