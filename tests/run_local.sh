@@ -44,18 +44,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"${AS[@]}" "$PG_BIN/initdb" -D "$WORK/data" -A trust -U postgres >/dev/null
+# Password authentication (SCRAM), like Neon, so wrong-credential tests fail for real.
+# The password is random per run and never leaves this machine.
+TEST_PGPASSWORD="test-$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+printf '%s\n' "$TEST_PGPASSWORD" > "$WORK/pwfile"
+[ ${#AS[@]} -gt 0 ] && chown postgres "$WORK/pwfile"
+"${AS[@]}" "$PG_BIN/initdb" -D "$WORK/data" -A scram-sha-256 --pwfile="$WORK/pwfile" -U postgres >/dev/null
+rm -f "$WORK/pwfile"
 "${AS[@]}" "$PG_BIN/pg_ctl" -D "$WORK/data" -w -l "$WORK/server.log" \
   -o "-k $WORK -p $PORT -c listen_addresses=" start >/dev/null
 echo "Throwaway PostgreSQL $("$PG_BIN/postgres" --version | awk '{print $3}') running on socket $WORK (port $PORT, no TCP)"
 
 # --- point the local-only psycopg2 test adapter at it
-export PGSHIM_HOST="$WORK" PGSHIM_PORT="$PORT" PGSHIM_USER=postgres
+export PGSHIM_HOST="$WORK" PGSHIM_PORT="$PORT" PGSHIM_USER=postgres PGPASSWORD="$TEST_PGPASSWORD"
 export PYTHONPATH="$TESTS/pg_adapter:$TESTS"
 unset INCITY_DB_URL
 
 status=0
-for suite in test_units.py test_migration.py test_e2e.py; do
+for suite in test_units.py test_migration.py test_e2e.py test_diagnostics.py; do
   echo; echo "=== $suite ==="
   python3 "$TESTS/$suite" 2> "$WORK/$suite.stderr" || { status=1; echo "--- $suite stderr (last 20 lines) ---"; tail -20 "$WORK/$suite.stderr"; }
 done

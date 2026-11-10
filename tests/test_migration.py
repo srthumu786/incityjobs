@@ -77,7 +77,7 @@ c.ok("data", sql(DB, "SELECT count(*) FROM information_schema.columns WHERE tabl
      and fingerprint(DB) == before, "dry run: no schema change, every legacy row byte-identical")
 
 # 2. Real migration with duplicates present
-conn = psycopg2.connect("local")
+conn = psycopg2.connect("postgresql://local-test")
 rep = db_schema.apply_schema(conn)
 emp, cand = rep["constraints"]["beta_employers"], rep["constraints"]["candidate_profiles"]
 c.ok("data", emp["status"] == "skipped_duplicates" and emp["duplicates"][0][:2] == ("hiring@legacy.com", 2),
@@ -136,7 +136,7 @@ load_legacy_schema(DB2)
 sql(DB2, "ALTER TABLE candidate_profiles ADD COLUMN contact_email VARCHAR(255);"
          "CREATE INDEX uq_candidate_profiles_contact_email ON candidate_profiles (contact_email);"  # same name, NOT unique
          "CREATE UNIQUE INDEX uq_beta_employers_admin_email ON beta_employers (admin_email);")      # unique, but case-sensitive
-conn2 = psycopg2.connect("local")
+conn2 = psycopg2.connect("postgresql://local-test")
 with conn2.cursor() as cur:
     cur.execute(db_schema.BASE_SCHEMA_SQL)
     pre_c = db_schema.verify_unique_index(cur, "uq_candidate_profiles_contact_email", "candidate_profiles", "contact_email")
@@ -159,7 +159,7 @@ c.ok("data", sql(DB2, "SELECT count(*) FROM candidate_profiles WHERE lower(conta
 
 # ================================================================ fresh database
 fresh_db("fresh_db")
-rep4 = db_schema.apply_schema(psycopg2.connect("local"))
+rep4 = db_schema.apply_schema(psycopg2.connect("postgresql://local-test"))
 c.ok("data", rep4["complete"], "fresh database: both UNIQUE constraints created and verified")
 c.ok("data", run_check().returncode == 0, "preflight on a clean database exits 0")
 

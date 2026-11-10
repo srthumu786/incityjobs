@@ -10,12 +10,21 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import psycopg2
 import psycopg2.pool
 
 import auth
 import db_schema
+from diagnostics import (
+    DIAGNOSTIC_CODES,
+    DatabaseConnectionError,
+    SchemaMigrationError,
+    StartupDiagnosticError,
+    install_redacting_filter,
+    redact,
+)
 from matching import (
     CandidateRecord,
     JobCriteria,
@@ -28,6 +37,25 @@ from matching import (
 
 logger = logging.getLogger("incityjobs")
 
+
+def _configured_secret_values():
+    """The configured connection string and its password, so log redaction can
+    mask them even if a driver error message echoes them back."""
+    try:
+        dsn = str(st.secrets.get("connection_string") or "")
+    except Exception:
+        return ()
+    values = [dsn]
+    try:
+        values.append(urlsplit(dsn).password or "")
+    except ValueError:
+        pass
+    return tuple(v for v in values if v)
+
+
+# Every record from this logger (message, traceback, chained causes) is redacted.
+install_redacting_filter(logger, _configured_secret_values)
+
 # ==============================================================================
 # 🗄️ CENTRALIZED DATABASE ACCESS (single pool + one-time schema setup)
 # ==============================================================================
@@ -37,6 +65,10 @@ logger = logging.getLogger("incityjobs")
 #   candidate_profiles    - candidate profiles      (Employee Portal + Manager Console)
 #   semantic_matches      - match ledger / 3-Way Push Engine queue
 #   system_telemetry_logs - handled runtime failures
+#
+# Startup failures are raised as diagnostics.DatabaseConnectionError (ICJ-ERR-500)
+# or diagnostics.SchemaMigrationError (ICJ-ERR-511). Only errors raised inside a
+# request's own `with get_db_cursor() as cur:` block keep the caller's code.
 
 
 @st.cache_resource(show_spinner=False)
@@ -48,6 +80,16 @@ def _get_db_pool():
         dsn=st.secrets["connection_string"],
         connect_timeout=10,
     )
+
+
+def _open_pool():
+    """The shared pool, or DatabaseConnectionError (ICJ-ERR-500) if it can't be opened."""
+    try:
+        return _get_db_pool()
+    except (KeyError, FileNotFoundError) as exc:
+        raise DatabaseConnectionError("Streamlit secret 'connection_string' is missing") from exc
+    except Exception as exc:
+        raise DatabaseConnectionError(f"could not open the database connection pool ({type(exc).__name__})") from exc
 
 
 def _checkout_connection(pool):
@@ -66,6 +108,14 @@ def _checkout_connection(pool):
     return conn
 
 
+def _open_connection(pool):
+    """A healthy pooled connection, or DatabaseConnectionError (ICJ-ERR-500)."""
+    try:
+        return _checkout_connection(pool)
+    except Exception as exc:
+        raise DatabaseConnectionError(f"could not obtain a database connection ({type(exc).__name__})") from exc
+
+
 def _release_connection(pool, conn):
     pool.putconn(conn, close=bool(conn.closed))
 
@@ -73,30 +123,32 @@ def _release_connection(pool, conn):
 @st.cache_resource(show_spinner=False)
 def ensure_schema() -> dict:
     """Create/migrate the production tables once per server process and return the
-    migration report. A failure is not cached, so the next request retries."""
-    pool = _get_db_pool()
-    conn = _checkout_connection(pool)
+    migration report. A failure is not cached, so the next request retries.
+    Raises DatabaseConnectionError (ICJ-ERR-500) or SchemaMigrationError (ICJ-ERR-511)."""
+    pool = _open_pool()
+    conn = _open_connection(pool)
     try:
         report = db_schema.apply_schema(conn)
         if not report["complete"]:
             # Uniqueness is not verified active; app-level duplicate checks still run
             detail = "; ".join(
                 f"{t}.{e['column']}: {e['status']} ({len(e['duplicates'])} duplicate email groups; "
-                f"{', '.join(e['verification']['problems']) or 'verified'})"
+                f"{', '.join(e['verification']['problems']) or 'verified'}"
+                f"{'; ' + e['error'] if e.get('error') else ''})"
                 for t, e in report["constraints"].items() if e["status"] != "enforced" or not e["verification"]["active"]
             )
-            logger.error("ICJ-ERR-511 [startup.schema.unique_email] %s", detail)
+            logger.warning("ICJ-ERR-518 [startup.schema.unique_email] %s", detail)
             # Written directly: the normal telemetry path depends on this function
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO system_telemetry_logs (diagnostic_error_code, error_context_vector, error_detail) VALUES (%s, %s, %s);",
-                    ("ICJ-ERR-511", "startup.schema.unique_email", detail),
+                    ("ICJ-ERR-518", "startup.schema.unique_email", redact(detail, _configured_secret_values())),
                 )
             conn.commit()
-    except Exception:
+    except Exception as exc:
         if not conn.closed:
             conn.rollback()
-        raise
+        raise SchemaMigrationError(f"schema migration failed ({type(exc).__name__})") from exc
     finally:
         _release_connection(pool, conn)
     return report
@@ -109,10 +161,12 @@ def get_db_cursor():
     connection to the pool. Usage:
         with get_db_cursor() as cur:
             cur.execute("SELECT ...", (param,))
+    Startup problems raise DatabaseConnectionError / SchemaMigrationError before
+    the block runs; errors from the caller's own queries propagate unchanged.
     """
     ensure_schema()
-    pool = _get_db_pool()
-    conn = _checkout_connection(pool)
+    pool = _open_pool()
+    conn = _open_connection(pool)
     try:
         with conn.cursor() as cur:
             yield cur
@@ -126,39 +180,30 @@ def get_db_cursor():
 
 
 # ==============================================================================
-# 🩺 TRANSPARENT ERROR REPORTING (system_telemetry_logs)
+# 🩺 TRANSPARENT ERROR REPORTING (logs + system_telemetry_logs)
 # ==============================================================================
-# Diagnostic codes for handled runtime failures. Each one is written to the Python
-# log and to system_telemetry_logs, and shown to the user with the matching code.
-DIAGNOSTIC_CODES = {
-    "ICJ-ERR-501": "Candidate duplicate check failed",
-    "ICJ-ERR-502": "Candidate profile save failed",
-    "ICJ-ERR-503": "Candidate target-location geocoding service failed",
-    "ICJ-ERR-504": "Employer duplicate check failed",
-    "ICJ-ERR-505": "Employer registration save failed",
-    "ICJ-ERR-506": "Job worksite geocoding service failed",
-    "ICJ-ERR-507": "Job requisition save failed",
-    "ICJ-ERR-508": "Employee proximity map query failed",
-    "ICJ-ERR-509": "Manager console candidate read failed",
-    "ICJ-ERR-510": "Manager console match logging failed",
-    "ICJ-ERR-511": "UNIQUE email constraint not enforced (existing duplicates)",
-    "ICJ-ERR-512": "Employer sign-in lookup failed",
-    "ICJ-ERR-513": "Employer setup-code redemption failed",
-    "ICJ-ERR-514": "Manager console job list failed",
-    "ICJ-ERR-515": "Employer setup-code issue failed",
-    "ICJ-ERR-516": "Manager console system checks failed",
-    "ICJ-ERR-517": "Employer account verification failed at job submit",
-}
+# Codes are defined in diagnostics.py. Details and tracebacks go only to the
+# protected server log (redacted); users see a plain message, the code and what to do.
 
 
 def log_system_event(code: str, context: str, exc: BaseException = None) -> None:
-    """Record a handled failure in the Python log and in system_telemetry_logs.
-    Never raises, so reporting an error can't break the request that hit it."""
-    detail = f"{type(exc).__name__}: {exc}"[:2000] if exc else None
-    logger.error("%s [%s] %s", code, context, detail or DIAGNOSTIC_CODES.get(code, ""), exc_info=exc)
-    if isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError)):
-        # The database itself is unreachable; skip the telemetry write instead of
-        # making the user wait for a second connection timeout.
+    """Record a handled failure in the server log (with traceback) and in
+    system_telemetry_logs. Never raises, so reporting an error can't break the
+    request that hit it."""
+    secrets = _configured_secret_values()
+    if isinstance(exc, StartupDiagnosticError):
+        cause = exc.__cause__
+        detail = f"{exc.reason}; cause: {type(cause).__name__}: {cause}" if cause else exc.reason
+    else:
+        detail = f"{type(exc).__name__}: {exc}" if exc else DIAGNOSTIC_CODES.get(code, "")
+    detail = redact(detail, secrets)[:2000]
+    if exc is not None:
+        logger.exception("%s [%s] %s", code, context, detail, exc_info=exc)
+    else:
+        logger.error("%s [%s] %s", code, context, detail)
+    if isinstance(exc, (StartupDiagnosticError, psycopg2.OperationalError, psycopg2.InterfaceError)):
+        # The database is unreachable or not initialised; a telemetry write would
+        # fail too (and make the user wait for another connection attempt).
         return
     try:
         with get_db_cursor() as cur:
@@ -171,11 +216,14 @@ def log_system_event(code: str, context: str, exc: BaseException = None) -> None
 
 
 def report_failure(code: str, context: str, user_message: str, exc: BaseException = None, level: str = "error") -> None:
-    """Log the failure and show the user a message carrying its diagnostic code."""
+    """Log the failure and show the user a plain message with its diagnostic code.
+    A startup failure always keeps its own code (ICJ-ERR-500/511) and message,
+    whatever operation was running when it surfaced."""
+    if isinstance(exc, StartupDiagnosticError):
+        code, context, user_message, level = exc.code, f"{exc.stage} (while {context})", exc.user_message, "error"
     log_system_event(code, context, exc)
     show = st.warning if level == "warning" else st.error
     show(f"{user_message} (Diagnostic code: {code})")
-
 
 # ==============================================================================
 # 🔐 AUTHENTICATED SESSIONS (signed, expiring tokens; see auth.py)
@@ -880,7 +928,7 @@ def system_checks_tab():
             st.warning("Duplicate emails block the constraint. Merge or correct these rows; the constraint is added on the next app restart.")
             st.dataframe([{"Email": d[0], "Copies": d[1], "Row ids": ", ".join(map(str, d[2]))} for d in entry["duplicates"]], width="stretch")
         if entry.get("error"):
-            st.error(entry["error"])
+            st.error("Creating this UNIQUE index failed. Details are in the server log (Diagnostic code: ICJ-ERR-518).")
 
     st.markdown("#### Historical fallback-location records")
     fallback = report["legacy_fallback_rows"]

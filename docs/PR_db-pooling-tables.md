@@ -12,7 +12,8 @@ The final commit ID is reported with the review submission (this file is part of
 | `2282c70` | Per-session candidate privacy, manager gate, telemetry, pinned dependencies |
 | `263836d` | Employer auth, signed manager sessions, UNIQUE emails, no geocode fallback, live vs simulated matching |
 | `566c2f0` | Review requirements 1–7 below |
-| *(latest)* | Registration confirmation shows only confirmed facts; regression test |
+| `a08c2d5` | Registration confirmation shows only confirmed facts; regression test |
+| *(latest)* | Startup diagnostics: ICJ-ERR-500/511 separated from ICJ-ERR-504, redacted server logging |
 
 ## Review requirements → changes
 | # | Requirement | Change | Files |
@@ -25,6 +26,21 @@ The final commit ID is reported with the review submission (this file is part of
 | 6 | PR document on the branch | This file | `docs/PR_db-pooling-tables.md` |
 | 7 | Staging manual | Private staging app on a Neon test branch, step by step, with teardown and production cut-over | `docs/STAGING_DEPLOYMENT.md` |
 
+## Startup diagnostics (follow-up from the staging incident)
+On staging, a wrong database password was reported as ICJ-ERR-504, the employer duplicate-check code. Errors are now classified by the operation that failed (`diagnostics.py`):
+
+| Code | Raised when |
+|---|---|
+| ICJ-ERR-500 | Opening the database connection fails, including a missing or invalid `connection_string` secret |
+| ICJ-ERR-511 | The schema migration fails (rolled back as before) |
+| ICJ-ERR-504 | Only the employer duplicate-check query itself fails |
+| ICJ-ERR-518 | UNIQUE email constraint not verified active. This was ICJ-ERR-511 before; it was moved because 511 now means migration failure. |
+
+- `get_db_cursor()` raises typed startup errors before the caller's query runs. `report_failure()` always shows a startup error's own code and message, so no page can relabel it (verified from registration, sign-in and candidate intake).
+- Details go to the protected server log through `logger.exception()`, with the full traceback including chained causes. A logging filter redacts connection-string passwords, `password=` values, the configured secret, emails and password hashes from the message and the traceback. Telemetry details are redacted the same way.
+- Users see a plain message, the code and what to do next. No exception text is shown, including on the manager-only System Checks tab.
+- Unchanged: registration safeguards, connection pooling, migration behaviour, database records and telemetry. Startup failures still skip the telemetry write, because the database is unavailable.
+
 ## Registration confirmation (follow-up from staging review)
 The block shown after a successful employer registration claimed things that weren't true or weren't built yet. These were "Fully Verified & Logged Nationwide", "Secure Travel Mode", "Deferred Settlement Active", "Merchant Routing Network", "Database Routing ID: ICJ-GLOBAL-…", "Cryptographic Contract Seal", and a promise of automated matching notifications. It now states only confirmed facts: registration successful, signed in, verification pending, and job posting unavailable until a manager approves the company. Registration security, the stored record (including `signature_hash`) and payment logic are unchanged. `tests/test_e2e.py` fails if any of those claims reappear for an unverified employer.
 
@@ -35,12 +51,13 @@ The block shown after a successful employer registration claimed things that wer
 - Verified by `tests/test_migration.py`: row counts plus an md5 over every original column of every table are identical before and after the migration, and after re-running it.
 
 ## Test evidence
-Run: `bash tests/run_local.sh` (throwaway PostgreSQL 16.15, Unix socket only)
+Run: `bash tests/run_local.sh` (throwaway PostgreSQL 16.15, Unix socket only, SCRAM password auth)
 ```
-unit tests:        23/23 passed (security 14/14, processing 6/6, data 3/3)
+unit tests:        32/32 passed (security 23/23, processing 6/6, data 3/3)
 migration tests:   27/27 passed (data 22/22, security 5/5)
 end-to-end tests:  69/69 passed (security 40/40, data 14/14, processing 15/15)
-ALL SUITES PASSED   (119/119)
+diagnostics tests: 33/33 passed (classification 12/12, logging 5/5, security 9/9, data 4/4, processing 1/1, telemetry 2/2)
+ALL SUITES PASSED   (161/161)
 ```
 
 ## Not verified yet (needs the staging app)

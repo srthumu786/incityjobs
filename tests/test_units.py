@@ -76,4 +76,52 @@ p = build_push_payload(job, r, "2026-11-08T00:00:00+00:00")
 c.ok("processing", p["delivery_status"] == "NOT_SENT_GATEWAY_PENDING" and p["job"]["job_id"] == 1 and p["employer"]["contact_email"] == "hr@apex.com",
      "push payload carries job, employer and pending (unsent) delivery status")
 
+# ------------------------------------------------------------------ diagnostics: codes and redaction
+import io
+import logging
+from diagnostics import (DIAGNOSTIC_CODES, DatabaseConnectionError, RedactingFilter, SchemaMigrationError,
+                         StartupDiagnosticError, redact)
+
+c.ok("security", DatabaseConnectionError.code == "ICJ-ERR-500" and SchemaMigrationError.code == "ICJ-ERR-511"
+     and "duplicate-check query" in DIAGNOSTIC_CODES["ICJ-ERR-504"] and "UNIQUE" in DIAGNOSTIC_CODES["ICJ-ERR-518"]
+     and issubclass(DatabaseConnectionError, StartupDiagnosticError) and issubclass(SchemaMigrationError, StartupDiagnosticError),
+     "codes: 500 = connection init, 511 = schema migration, 504 = duplicate-check query, 518 = uniqueness not verified")
+c.ok("security", all("Traceback" not in e.user_message and "ICJ" not in e.user_message and "try again" in e.user_message.lower()
+                     and "contact" in e.user_message.lower() for e in (DatabaseConnectionError, SchemaMigrationError)),
+     "startup user messages: plain explanation + next action, no technical detail")
+
+SECRET_PW = "Npg-S3cretPw-XYZ"
+SECRET_DSN = f"postgresql://neondb_owner:{SECRET_PW}@ep-demo-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+libpq_echo = f'invalid dsn: missing "=" after "{SECRET_DSN}" in connection info string'
+c.ok("security", SECRET_PW not in redact(libpq_echo) and "neondb_owner:***@" in redact(libpq_echo),
+     "redact: password inside a postgresql:// URI (as libpq echoes a malformed DSN)")
+c.ok("security", redact("host=h user=u password=hunter2-Secret dbname=d") == "host=h user=u password=*** dbname=d"
+     and redact("PGPASSWORD='quoted secret value'") == "PGPASSWORD=***", "redact: password= / PGPASSWORD= values (plain and quoted)")
+c.ok("security", redact("connection failed for token abcdefSECRETVALUE", secrets=("abcdefSECRETVALUE",)) == "connection failed for token ***",
+     "redact: exact configured secret values")
+c.ok("security", redact('DETAIL: Key (lower(btrim(admin_email)))=(hr@apex.com) already exists.') == 'DETAIL: Key (lower(btrim(admin_email)))=(<email>) already exists.',
+     "redact: email addresses (personal information) in database error details")
+c.ok("security", "<password-hash>" in redact(f"stored {auth.hash_password('x' * 12, iterations=1)}") and "$pbkdf2-sha256$600000$ab$cd" not in redact("$pbkdf2-sha256$600000$ab$cd"),
+     "redact: password hashes (both formats)")
+
+buffer = io.StringIO()
+test_logger = logging.getLogger("incityjobs.unit-redaction")
+test_logger.propagate = False
+handler = logging.StreamHandler(buffer); handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+test_logger.addHandler(handler)
+test_logger.addFilter(RedactingFilter(lambda: (SECRET_DSN, SECRET_PW)))
+try:
+    try:
+        raise ValueError(f"driver said: could not connect using {SECRET_DSN} for jane@x.com")
+    except ValueError as inner:
+        raise DatabaseConnectionError("could not open the database connection pool (ValueError)") from inner
+except DatabaseConnectionError as exc:
+    test_logger.exception("%s [%s] %s", "ICJ-ERR-500", "unit", f"cause: {exc.__cause__}")
+logged = buffer.getvalue()
+c.ok("security", logged.startswith("ERROR ICJ-ERR-500") and "Traceback (most recent call last)" in logged
+     and "The above exception was the direct cause" in logged,
+     "logger.exception output keeps the full traceback, including the chained cause")
+c.ok("security", SECRET_PW not in logged and "jane@x.com" not in logged and "***" in logged and "<email>" in logged,
+     "log message AND traceback are redacted (password, connection string, email)")
+
 c.summary()
