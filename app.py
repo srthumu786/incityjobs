@@ -29,8 +29,10 @@ from recommendations import (
     CONSENT_FOOTNOTE,
     CONSENT_LABEL,
     consent_state,
+    employer_recommendations,
     generate_for_candidate,
     generate_for_job,
+    open_recommendation,
     reconcile_employer,
     set_matching_consent,
 )
@@ -698,6 +700,88 @@ def _handle_setup_code(email: str, code: str, new_password: str, confirm: str) -
 
 
 # ==============================================================================
+# ⭐ RECOMMENDED CANDIDATES (employer dashboard)
+# ==============================================================================
+def render_recommended_candidates():
+    """Anonymized, ranked recommendations for the signed-in, VERIFIED employer's own
+    openings only. No search, no browsing, no export. Every read re-checks the
+    employer (signed token + unchanged credential + verified) and live eligibility
+    (candidate consent) in the database."""
+    st.markdown("### ⭐ Recommended Candidates")
+    employer = current_employer()
+    if employer is None:
+        end_employer_session()
+        st.info("🔐 Sign in on the **Post a Job** tab to see recommendations for your openings.")
+        return
+    if not employer["verified"]:
+        st.warning("⏳ Recommendations become available once an InCityJobs manager has verified your company.")
+        return
+    st.caption("Candidates matched to **your own** openings who opted in to be shown anonymously. Names, contact details "
+               "and resumes are never shared here. Contact details require the candidate's separate permission.")
+
+    def load():
+        with get_db_cursor() as cur:
+            return employer_recommendations(cur, employer["id"])
+
+    try:
+        items = load()
+    except Exception as e:
+        report_failure("ICJ-ERR-520", "employer_portal.recommendations.load", "❌ Recommendations could not be loaded. Please try again.", e)
+        return
+
+    if not items:
+        st.session_state.pop("opened_recommendation", None)
+        st.info("No recommendations yet. They appear here automatically when opted-in candidates match your openings.")
+        return
+
+    # Show the opened profile only while it is still this employer's eligible item
+    # (consent withdrawal or verification revocation hides it on the next page load).
+    by_ref = {item["ref"]: item for item in items}
+    opened_ref = st.session_state.get("opened_recommendation")
+    if opened_ref is not None and opened_ref not in by_ref:
+        st.session_state.pop("opened_recommendation", None)
+        opened_ref = None
+    if opened_ref:
+        item = by_ref[opened_ref]
+        p = item["profile"]
+        st.success(f"**Candidate {item['ref']}** for **{html.escape(item['job_title'])}**")
+        st.write(f"**Match strength:** {p['score_band']} · **Distance:** {p['distance_band']} · "
+                 f"**Matched qualifications:** {', '.join(p['qualifications']) or 'none from the qualification dictionary'}")
+        st.info("Contact details are shared only if the candidate separately authorizes it. That option isn't available yet.")
+
+    new_total = sum(item["is_new"] for item in items)
+    st.write(f"**{len(items)}** recommendation(s) · **{new_total}** new")
+    jobs = {}
+    for item in items:
+        jobs.setdefault((item["job_id"], item["job_title"]), []).append(item)
+    for (job_id, title), job_items in jobs.items():
+        new_here = sum(i["is_new"] for i in job_items)
+        with st.expander(f"💼 {title}: {len(job_items)} candidate(s){f' · {new_here} new' if new_here else ''}", expanded=True):
+            st.dataframe([{
+                "Candidate": item["ref"] + (" 🆕" if item["is_new"] else ""),
+                "Match strength": item["profile"]["score_band"],
+                "Distance": item["profile"]["distance_band"],
+                "Matched qualifications": ", ".join(item["profile"]["qualifications"]) or "—",
+                "Status": "Viewed" if item["status"] == "VIEWED" else "Not opened yet",
+            } for item in job_items], width="stretch")
+            # Buttons exist only for this employer's own eligible items; opening re-checks
+            # ownership and eligibility server-side and is audited once per click.
+            for item in job_items:
+                if st.button(f"Open profile {item['ref']}", key=f"open_rec_{item['ref']}"):
+                    try:
+                        with get_db_cursor() as cur:
+                            opened = open_recommendation(cur, employer["id"], item["ref"], actor_ref=str(employer["id"]))
+                    except Exception as e:
+                        report_failure("ICJ-ERR-520", "employer_portal.recommendations.open", "❌ The profile could not be opened. Please try again.", e)
+                        opened = None
+                    if opened is None:
+                        st.warning("This profile is no longer available.")
+                    else:
+                        st.session_state["opened_recommendation"] = item["ref"]
+                        st.rerun()
+
+
+# ==============================================================================
 # 🔐 MANAGER ACCESS (named accounts from secrets + signed session token)
 # ==============================================================================
 def render_manager_access_panel():
@@ -1155,7 +1239,7 @@ elif page_selection == "Employer Portal":
     st.title("🏢 Employer Pre-Onboarding & Requisition Node")
     st.subheader(f"Secure Local Workforce Acquisition Matrix ({region_meta['region']})")
 
-    emp_tab1, emp_tab2 = st.tabs(["📋 Corporate Registration", "💼 Post a Job (Requisition Form)"])
+    emp_tab1, emp_tab2, emp_tab3 = st.tabs(["📋 Corporate Registration", "💼 Post a Job (Requisition Form)", "⭐ Recommended Candidates"])
 
     with emp_tab1:
         st.error(prelaunch_message)
@@ -1315,6 +1399,10 @@ elif page_selection == "Employer Portal":
                             })
                         except Exception as e:
                             report_failure("ICJ-ERR-507", "employer_portal.job_requisition.save", "❌ Database Synchronization Pipeline Failure: the job was not published.", e)
+
+
+    with emp_tab3:
+        render_recommended_candidates()
 
 
 # ==============================================================================

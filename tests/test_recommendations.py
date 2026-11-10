@@ -345,4 +345,134 @@ c.ok("concurrency", stale == "0" and all(st_.split("|")[0] in ("QUEUED", "WITHDR
                                          for st_ in withdrawn_states),
      f"consent withdrawn during concurrent generation: final statuses reflect current consent, never visible {withdrawn_states}")
 
+
+# ================================================================== employer dashboard (commit 4)
+PII = ["Jane", "jane@x.com", "Maria", "Gonzalez", "Whitfield", "maria.gw", "Magnolia", "Oak Hollow", "Huntsville", "555-0147",
+       "Existing Person", "existing@x.com", "noconsent@x.com", "Load 1", "load1@x.com", "Acme", "Auburn", "Tagalog", "GXPN"]
+
+
+def dashboard(state):
+    """Render the Employer Portal for a session; return (items shown, whole page text)."""
+    new_session(state)
+    run("Employer Portal")
+    page = " ".join(texts())
+    frames = [json.loads(t) for t in texts("dataframe")]
+    rows = [r for f in frames for r in f if "Candidate" in r and "Match strength" in r]
+    return rows, page
+
+
+def refs_of(employer_id, where="true"):
+    out = q(f"SELECT coalesce(string_agg(employer_ref, ','), '') FROM employer_recommendations WHERE employer_id = {employer_id} AND {where}")
+    return set(filter(None, out.split(",")))
+
+
+def view_events(rec_ref):
+    return int(q(f"SELECT count(*) FROM privacy_audit_log a JOIN employer_recommendations r ON r.id = a.recommendation_id "
+                 f"WHERE a.event_type = 'PROFILE_VIEWED' AND r.employer_ref = '{rec_ref}'"))
+
+
+# --- a second verified employer with its own job
+new_session()
+run("Employer Portal", employer_form("Bolt", "jobs@bolt.com"), {REGISTER})
+BOLT = int(q("SELECT id FROM beta_employers WHERE admin_email = 'jobs@bolt.com'"))
+BOLT_SESSION = session()
+new_session(ALICE)
+run("Manager Console", {"Employer": f"#{BOLT}"}, {"verify_employer"})
+new_session(BOLT_SESSION)
+run("Employer Portal", job_form(title="Data Engineer", city="Decatur"), {PUBLISH})
+
+apex_rows, apex_page = dashboard(APEX_SESSION)
+bolt_rows, bolt_page = dashboard(BOLT_SESSION)
+apex_visible = refs_of(APEX, "status IN ('AVAILABLE','VIEWED')")
+bolt_refs = refs_of(BOLT)
+apex_shown = {r["Candidate"].split()[0] for r in apex_rows}
+bolt_shown = {r["Candidate"].split()[0] for r in bolt_rows}
+c.ok("isolation", apex_shown and apex_shown <= apex_visible and not (apex_shown & bolt_refs) and "Data Engineer" not in apex_page,
+     f"Apex sees only its own jobs' recommendations ({len(apex_shown)} shown, none of Bolt's)", debug)
+c.ok("isolation", bolt_shown and bolt_shown <= bolt_refs and not (bolt_shown & refs_of(APEX)) and "Concurrent Job" not in bolt_page,
+     f"Bolt sees only its own job's recommendations ({len(bolt_shown)} shown, none of Apex's)")
+jane_refs = q(f"SELECT string_agg(employer_ref, ',') FROM employer_recommendations WHERE candidate_profile_id = {JANE}").split(",")
+c.ok("anonymization", len(set(jane_refs)) == len(jane_refs) >= 2, "the same candidate has different, unlinkable references per employer/job")
+c.ok("anonymization", [w for w in PII if w in apex_page + bolt_page] == [], f"no candidate PII anywhere on either employer's page {[w for w in PII if w in apex_page + bolt_page]}")
+c.ok("isolation", not any(t in apex_page for t in ("QUEUED", "WITHDRAWN")) and len(apex_shown) == len(apex_visible & apex_shown),
+     "only AVAILABLE/VIEWED recommendations are listed (no queued or withdrawn ones)")
+
+# --- cap: at most 20 per job, ranked
+q("INSERT INTO candidate_profiles (name, contact_email, role, resume, latitude, longitude, application_status, employer_matching_consent) "
+  "SELECT 'Extra ' || g, 'extra' || g || '@x.com', 'Dev', 'Python developer: sql, docker, microservices', 34.5251, -86.8947, 'PENDING', TRUE "
+  "FROM generate_series(1, 12) g;")
+with_cursor(recs.generate_for_job, CJOB)
+eligible_cjob = int(q(f"SELECT count(*) FROM employer_recommendations r JOIN candidate_profiles c ON c.id = r.candidate_profile_id "
+                      f"WHERE r.job_id = {CJOB} AND r.status IN ('AVAILABLE','VIEWED') AND c.employer_matching_consent"))
+new_session(APEX_SESSION); run("Employer Portal")
+cjob_frames = [json.loads(t) for t in texts("dataframe")]
+cjob_count = max(len(f) for f in cjob_frames if f and "Match strength" in f[0])
+c.ok("isolation", eligible_cjob > 20 and cjob_count == 20, f"at most 20 per job shown ({eligible_cjob} eligible -> {cjob_count} shown)")
+
+# --- opening a profile: VIEWED, audited once, badge cleared; no repeat logging on rerun
+target = sorted(apex_shown)[0]
+c.ok("status", run("Employer Portal", clicks={f"open_rec_{target}"}) == "rerun" and view_events(target) == 1
+     and q(f"SELECT status || '|' || is_new FROM employer_recommendations WHERE employer_ref = '{target}'") == "VIEWED|false",
+     "employer opens a profile -> VIEWED, badge cleared, one PROFILE_VIEWED audit row", debug)
+run("Employer Portal"); run("Employer Portal")
+c.ok("audit", view_events(target) == 1 and any(f"Candidate {target}" in t for t in texts("success")),
+     "opened profile stays displayed across reruns without logging extra views")
+
+# --- request / session manipulation
+foreign = sorted(bolt_shown)[0]
+before = q("SELECT count(*) FROM privacy_audit_log") + q(f"SELECT status FROM employer_recommendations WHERE employer_ref = '{foreign}'")
+new_session(APEX_SESSION)
+run("Employer Portal", clicks={f"open_rec_{foreign}"})
+c.ok("security", view_events(foreign) == 0 and foreign not in " ".join(texts()) and
+     q("SELECT count(*) FROM privacy_audit_log") + q(f"SELECT status FROM employer_recommendations WHERE employer_ref = '{foreign}'") == before,
+     "forged click on another employer's reference: nothing opened, shown, changed or logged")
+new_session({**APEX_SESSION, "opened_recommendation": foreign})
+run("Employer Portal")
+c.ok("security", foreign not in " ".join(texts()) and "opened_recommendation" not in ui.session_state and view_events(foreign) == 0,
+     "forged session_state pointing at another employer's reference: not displayed, cleared")
+denied_before = events("PROFILE_ACCESS_DENIED", f"employer_id = {APEX} AND detail->>'requested_ref' = '{foreign}'")
+c.ok("security", with_cursor(recs.open_recommendation, APEX, foreign) is None and view_events(foreign) == 0
+     and events("PROFILE_ACCESS_DENIED", f"employer_id = {APEX} AND detail->>'requested_ref' = '{foreign}'") == denied_before + 1,
+     "direct backend call with another employer's reference is refused and audited as PROFILE_ACCESS_DENIED")
+new_session({"employer_token": auth.issue_token(b"x" * 32, BOLT, auth.ROLE_EMPLOYER, 3600)})
+run("Employer Portal")
+c.ok("security", not any("Match strength" in t for t in texts("dataframe")) and not any("FROM employer_recommendations" in s_ for s_ in psycopg2.connection.log),
+     "forged employer session (wrong signing key): no recommendations read at all")
+new_session({**APEX_SESSION, "employer_company": "Bolt"})
+rows_tampered, _ = dashboard({**APEX_SESSION, "employer_company": "Bolt"})
+c.ok("security", {r["Candidate"].split()[0] for r in rows_tampered} <= refs_of(APEX), "tampering display fields in session_state doesn't change whose data is shown")
+new_session()
+run("Employer Portal")
+c.ok("security", not any("FROM employer_recommendations" in s_ for s_ in psycopg2.connection.log) and "Sign in on the **Post a Job** tab" in " ".join(texts()),
+     "signed-out visitor: prompt only, no recommendation query")
+
+# --- unverified employer: no access
+new_session()
+run("Employer Portal", employer_form("Cora", "hr@cora.com"), {REGISTER})
+run("Employer Portal")
+c.ok("security", "Recommendations become available once" in " ".join(texts()) and not any("FROM employer_recommendations" in s_ for s_ in psycopg2.connection.log),
+     "unverified employer: verification notice, no recommendation query")
+
+# --- revocations take effect immediately in the dashboard
+jane_apex = q(f"SELECT employer_ref FROM employer_recommendations WHERE candidate_profile_id = {JANE} AND job_id = {JOB}")
+new_session(APEX_SESSION); run("Employer Portal", clicks={f"open_rec_{jane_apex}"})
+APEX_OPENED = session()
+c.ok("status", APEX_OPENED.get("opened_recommendation") == jane_apex, "Apex has Jane's (anonymized) profile open")
+new_session(JANE_SESSION); run("Employee Portal", clicks={"withdraw_own_consent"})
+rows_after, page_after = dashboard(APEX_OPENED)
+c.ok("status", jane_apex not in page_after and "opened_recommendation" not in ui.session_state,
+     "candidate withdraws consent -> gone from the dashboard and the open profile closes on the next page load", debug)
+new_session(ALICE); run("Manager Console", {"Employer": f"#{APEX}"}, {"revoke_employer_verification"})
+rows_rev, page_rev = dashboard(APEX_SESSION)
+c.ok("status", rows_rev == [] and "Recommendations become available once" in page_rev, "employer verification revoked -> dashboard closed immediately")
+new_session(ALICE); run("Manager Console", {"Employer": f"#{APEX}"}, {"verify_employer"})
+
+# --- no repeated notifications for unchanged recommendations
+badge = lambda: int(q(f"SELECT count(*) FROM employer_recommendations WHERE employer_id = {APEX} AND is_new"))
+b0 = badge()
+for _ in range(2):
+    with_cursor(recs.reconcile_employer, APEX)
+new_session(ALICE); run("Manager Console", clicks={"recompute_all_recommendations"})
+c.ok("duplicates", badge() == b0, f"recomputing (reconcile x2 + manager recompute) leaves the 'new' badge count unchanged ({b0})")
+
 c.summary()
