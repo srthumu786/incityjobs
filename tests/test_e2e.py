@@ -217,11 +217,26 @@ run("Employer Portal", employer_form(), {REGISTER})
 stored = q("SELECT admin_email || ' | ' || password_hash || ' | ' || (verified_at IS NULL) FROM beta_employers;")
 c.ok("security", stored.startswith("hr@apex.com | pbkdf2_sha256$600000$") and stored.endswith("| true") and "apex-strong-pass-1" not in stored,
      "new employer: lowercase email, PBKDF2 hash, UNVERIFIED")
+# Regression: the registration confirmation states only confirmed facts. It must never
+# claim verification, payment/settlement, routing, contract seals or notifications.
+UNCONFIRMED_CLAIMS = ["Fully Verified", "Verified & Logged", "Secure Travel Mode", "Deferred Settlement", "Monetization Engine",
+                      "Merchant Routing", "Thumu Mercantile", "ICJ-GLOBAL", "Database Routing ID", "Cryptographic Contract Seal",
+                      "notifications will be routed", "Automated matching notifications"]
+def unconfirmed_claims_shown(): return [c_ for c_ in UNCONFIRMED_CLAIMS if any(c_ in t for t in texts())]
+confirmation = " | ".join(texts("success") + texts("info"))
+c.ok("security", unconfirmed_claims_shown() == [], f"registration confirmation shows no unconfirmed claims {unconfirmed_claims_shown()}", debug)
+c.ok("processing", "Registration successful" in confirmation and "signed in" in confirmation
+     and "Verification pending" in confirmation and "Job posting is unavailable until an InCityJobs manager approves" in confirmation,
+     "registration confirmation states: successful, signed in, verification pending, posting unavailable until manager approval", debug)
+c.ok("data", q("SELECT signature_hash FROM beta_employers WHERE admin_email = 'hr@apex.com';")
+     == __import__("hashlib").sha256(b"Apex-hr@apex.com-Ann-CONSENT_TRUE").hexdigest(),
+     "registration record unchanged: signature_hash still computed and stored as before")
 APEX = int(q("SELECT id FROM beta_employers WHERE admin_email = 'hr@apex.com';"))
 APEX_SESSION = session()
 run("Employer Portal", job_form(), {PUBLISH})
 c.ok("security", "job_requisition_form" not in ui.forms and any("Verification pending" in t for t in texts("warning")) and count("employer_jobs") == 1,
      "unverified employer is signed in but has NO posting privileges (no form, PUBLISH inserts nothing)", debug)
+c.ok("security", unconfirmed_claims_shown() == [], "unverified employer's later visits show no verified/payment/notification claims either", debug)
 
 new_session()
 run("Employer Portal", employer_form(email="  hr@APEX.com "), {REGISTER})

@@ -39,7 +39,7 @@ Expected last lines:
 ```
 unit tests: 23/23 passed (...)
 migration tests: 27/27 passed (...)
-end-to-end tests: 65/65 passed (...)
+end-to-end tests: 69/69 passed (...)
 ALL SUITES PASSED
 ```
 

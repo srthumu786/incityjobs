@@ -11,7 +11,8 @@ The final commit ID is reported with the review submission (this file is part of
 | `2798bcc` | Pooled connections, unified tables, run-once schema setup |
 | `2282c70` | Per-session candidate privacy, manager gate, telemetry, pinned dependencies |
 | `263836d` | Employer auth, signed manager sessions, UNIQUE emails, no geocode fallback, live vs simulated matching |
-| *(final)* | Review requirements 1–7 below |
+| `566c2f0` | Review requirements 1–7 below |
+| *(latest)* | Registration confirmation shows only confirmed facts; regression test |
 
 ## Review requirements → changes
 | # | Requirement | Change | Files |
@@ -24,6 +25,9 @@ The final commit ID is reported with the review submission (this file is part of
 | 6 | PR document on the branch | This file | `docs/PR_db-pooling-tables.md` |
 | 7 | Staging manual | Private staging app on a Neon test branch, step by step, with teardown and production cut-over | `docs/STAGING_DEPLOYMENT.md` |
 
+## Registration confirmation (follow-up from staging review)
+The block shown after a successful employer registration claimed things that weren't true or weren't built yet. These were "Fully Verified & Logged Nationwide", "Secure Travel Mode", "Deferred Settlement Active", "Merchant Routing Network", "Database Routing ID: ICJ-GLOBAL-…", "Cryptographic Contract Seal", and a promise of automated matching notifications. It now states only confirmed facts: registration successful, signed in, verification pending, and job posting unavailable until a manager approves the company. Registration security, the stored record (including `signature_hash`) and payment logic are unchanged. `tests/test_e2e.py` fails if any of those claims reappear for an unverified employer.
+
 ## Data preservation
 - Migrations are additive only: `CREATE … IF NOT EXISTS` and `ADD COLUMN IF NOT EXISTS`. No `UPDATE` or `DELETE` of existing rows.
 - Duplicate emails are reported, never merged or removed.
@@ -35,8 +39,8 @@ Run: `bash tests/run_local.sh` (throwaway PostgreSQL 16.15, Unix socket only)
 ```
 unit tests:        23/23 passed (security 14/14, processing 6/6, data 3/3)
 migration tests:   27/27 passed (data 22/22, security 5/5)
-end-to-end tests:  65/65 passed (security 38/38, data 13/13, processing 14/14)
-ALL SUITES PASSED   (115/115)
+end-to-end tests:  69/69 passed (security 40/40, data 14/14, processing 15/15)
+ALL SUITES PASSED   (119/119)
 ```
 
 ## Not verified yet (needs the staging app)

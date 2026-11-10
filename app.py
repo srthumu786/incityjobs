@@ -1006,24 +1006,10 @@ elif page_selection == "Employer Portal":
                     st.markdown("**Employer portal:** *Corporate entity footprint already logged and finalized in an earlier organizational ledger row transaction.*")
                 elif isinstance(new_employer, int):
                     _start_employer_session(new_employer, company_name, new_password_hash)
-                    st.balloons()
-                    st.success("🎉 **BETA REGISTRATION COMPLETED SUCCESSFULLY!** You're signed in.")
-                    st.info("⏳ **Verification pending:** an InCityJobs manager will verify your company before job posting is unlocked.")
-                    st.markdown(
-                        f"""
-                        ---
-                        ### 🔒 Your Account is Locked in Secure Travel Mode
-                        * **Company Status:** Fully Verified & Logged Nationwide
-                        * **Monetization Engine:** Deferred Settlement Active ('Pay After 2 Weeks')
-                        * **Merchant Routing Network:** Vaulted through Thumu Mercantile LLC
-                        * **Database Routing ID:** `ICJ-GLOBAL-{signature_hash[:8].upper()}`
-                        * **Cryptographic Contract Seal:** `{signature_hash}`
-
-                        **What Happens Next?**
-                        * Your corporate city footprint is locked securely inside your database tables.
-                        * Automated matching notifications will be routed directly to **{admin_email}**.
-                        """
-                    )
+                    # Only confirmed facts: new accounts are always unverified (verified_at is NULL),
+                    # so nothing here may claim verification, payments or notifications.
+                    st.success("✅ **Registration successful.** You're signed in.")
+                    st.info("⏳ **Verification pending.** Job posting is unavailable until an InCityJobs manager approves your company.")
 
     with emp_tab2:
         st.markdown("### 💼 Job Requisition & Footprint Ingestion Node")
