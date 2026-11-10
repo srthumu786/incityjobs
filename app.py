@@ -29,6 +29,9 @@ from recommendations import (
     CONSENT_FOOTNOTE,
     CONSENT_LABEL,
     consent_state,
+    generate_for_candidate,
+    generate_for_job,
+    reconcile_employer,
     set_matching_consent,
 )
 from matching import (
@@ -230,6 +233,35 @@ def report_failure(code: str, context: str, user_message: str, exc: BaseExceptio
     log_system_event(code, context, exc)
     show = st.warning if level == "warning" else st.error
     show(f"{user_message} (Diagnostic code: {code})")
+
+
+# ==============================================================================
+# ⭐ RECOMMENDATION REFRESH (docs/EMPLOYER_RECOMMENDATIONS_PLAN.md)
+# ==============================================================================
+_RECOMMENDATION_JOBS = {"job": generate_for_job, "candidate": generate_for_candidate, "employer": reconcile_employer}
+_RETRYABLE_PGCODES = ("40P01", "40001")  # deadlock detected, serialization failure
+
+
+def refresh_recommendations(kind: str, target_id: int, context: str, actor_type: str = "system",
+                            actor_ref: str = None, notify_user: bool = True):
+    """Recompute recommendations after a trigger (job published, candidate saved,
+    consent or verification changed). Runs in its own transaction AFTER the
+    triggering change was committed, so a failure here never undoes it.
+    Deadlocks/serialization failures are retried; other failures are reported
+    as ICJ-ERR-519 (read-time eligibility checks still protect employers)."""
+    for attempt in range(3):
+        try:
+            with get_db_cursor() as cur:
+                return _RECOMMENDATION_JOBS[kind](cur, target_id, actor_type=actor_type, actor_ref=actor_ref)
+        except Exception as exc:
+            if getattr(exc, "pgcode", None) in _RETRYABLE_PGCODES and attempt < 2:
+                continue
+            if notify_user:
+                report_failure("ICJ-ERR-519", context, "⚠️ Your change was saved, but candidate recommendations "
+                               "could not be refreshed just now. They will refresh on the next update.", exc, level="warning")
+            else:
+                log_system_event("ICJ-ERR-519", context, exc)
+            return None
 
 # ==============================================================================
 # 🔐 AUTHENTICATED SESSIONS (signed, expiring tokens; see auth.py)
@@ -507,6 +539,9 @@ def candidate_profile_ingestion_ui():
 
     # Remember this visitor's own row so the proximity map shows only their data
     st.session_state['last_ingested_candidate'] = new_candidate_id
+    # Recommendations: QUEUED without consent, AVAILABLE to verified employers with it
+    refresh_recommendations("candidate", new_candidate_id, "employee_portal.intake.recommendations",
+                            actor_type="candidate", actor_ref="intake_form", notify_user=False)
     st.success("🎉 **DYNAMIC DUAL-LOCATION INGESTION COMPLETED SUCCESSFULLY!**")
     if matching_consent:
         st.info("🛡️ **Employer matching: ON.** Verified employers with matching openings may see your anonymized profile. You can withdraw below.")
@@ -541,6 +576,10 @@ def change_candidate_consent(candidate_id: int, granted: bool, actor_type: str, 
     except Exception as e:
         report_failure("ICJ-ERR-521", context, "❌ Your consent choice could not be saved. Nothing was changed. Please try again.", e)
         return False
+    # Withdrawal takes effect immediately for employers via read-time checks; this
+    # also moves the stored statuses (WITHDRAWN / restored) and audits them.
+    refresh_recommendations("candidate", candidate_id, context + ".recommendations",
+                            actor_type=actor_type, actor_ref=actor_ref, notify_user=False)
     return True
 
 
@@ -912,6 +951,9 @@ def employer_access_tab():
         except Exception as e:
             report_failure("ICJ-ERR-515", "manager_console.employer_access.verification", "❌ The verification change was not saved.", e)
             return
+        # Revocation blocks access immediately (read-time checks); this also updates statuses
+        refresh_recommendations("employer", chosen[0], "manager_console.employer_access.recommendations",
+                                actor_type="manager", actor_ref=current_manager())
         st.success(f"{chosen[1]} is now {'verified' if verify_clicked else 'unverified'}.")
         st.rerun()
     if st.button("Generate one-time setup code", key="issue_setup_code"):
@@ -1052,6 +1094,20 @@ def consent_audit_tab(manager: str):
             if consented and st.button("Record consent withdrawal requested by the candidate", key="manager_withdraw_consent"):
                 if change_candidate_consent(candidate_id, False, "manager", manager, "manager_console.consent.withdraw"):
                     st.success("Consent withdrawn and recorded in the audit log.")
+
+    st.markdown("### ⭐ Recommendations")
+    st.caption("Recompute every employer job's recommendations, e.g. after a failed refresh (ICJ-ERR-519). Safe to repeat.")
+    if st.button("Recompute all recommendations", key="recompute_all_recommendations"):
+        try:
+            with get_db_cursor() as cur:
+                cur.execute("SELECT id FROM employer_jobs WHERE employer_id IS NOT NULL ORDER BY id;")
+                job_ids = [r[0] for r in cur.fetchall()]
+        except Exception as e:
+            report_failure("ICJ-ERR-519", "manager_console.recommendations.recompute", "❌ Recompute could not start.", e)
+            job_ids = []
+        done = sum(refresh_recommendations("job", j, "manager_console.recommendations.recompute",
+                                           actor_type="manager", actor_ref=manager) is not None for j in job_ids)
+        st.success(f"Recomputed {done} of {len(job_ids)} jobs.")
 
     st.markdown("### 📜 Privacy Audit Log (append-only)")
     try:
@@ -1246,6 +1302,8 @@ elif page_selection == "Employer Portal":
                                 new_job_id = cursor.fetchone()[0]
 
                             st.success("🎉 **JOB REQUISITION SYSTEM DEPLOYED LIVE TO NEON CLUSTER!**")
+                            refresh_recommendations("job", new_job_id, "employer_portal.job_requisition.recommendations",
+                                                    actor_type="employer", actor_ref=str(employer_id))
                             st.json({
                                 "job_id": new_job_id,
                                 "requisition_title": job_title,

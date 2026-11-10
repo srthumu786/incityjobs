@@ -49,7 +49,7 @@ trap cleanup EXIT
 TEST_PGPASSWORD="test-$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
 printf '%s\n' "$TEST_PGPASSWORD" > "$WORK/pwfile"
 [ ${#AS[@]} -gt 0 ] && chown postgres "$WORK/pwfile"
-"${AS[@]}" "$PG_BIN/initdb" -D "$WORK/data" -A scram-sha-256 --pwfile="$WORK/pwfile" -U postgres >/dev/null
+"${AS[@]}" "$PG_BIN/initdb" -D "$WORK/data" -A scram-sha-256 --pwfile="$WORK/pwfile" -U postgres -E UTF8 --locale=C >/dev/null  # UTF-8 like Neon
 rm -f "$WORK/pwfile"
 "${AS[@]}" "$PG_BIN/pg_ctl" -D "$WORK/data" -w -l "$WORK/server.log" \
   -o "-k $WORK -p $PORT -c listen_addresses=" start >/dev/null

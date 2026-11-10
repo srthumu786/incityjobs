@@ -124,4 +124,50 @@ c.ok("security", logged.startswith("ERROR ICJ-ERR-500") and "Traceback (most rec
 c.ok("security", SECRET_PW not in logged and "jane@x.com" not in logged and "***" in logged and "<email>" in logged,
      "log message AND traceback are redacted (password, connection string, email)")
 
+# ------------------------------------------------------------------ recommendations: pure rules
+import recommendations as recs
+from matching import MatchResult
+
+def T(current, matches=True, eligible=True, fp="B", notified="A", viewed=None):
+    t = recs.plan_transition(current, matches=matches, eligible=eligible, fingerprint=fp,
+                             notified_fingerprint=notified, viewed_fingerprint=viewed)
+    return None if t is None else (t.status, t.set_new, t.event)
+
+cases = [
+    ("no row, no match -> nothing created",                 T(None, matches=False),                         None),
+    ("no row, match, not eligible -> QUEUED",               T(None, eligible=False, notified=None),        ("QUEUED", False, "RECOMMENDATION_QUEUED")),
+    ("no row, eligible -> AVAILABLE + badge",               T(None, notified=None),                        ("AVAILABLE", True, "RECOMMENDATION_AVAILABLE")),
+    ("QUEUED, consent granted -> AVAILABLE + badge",        T("QUEUED", notified=None),                    ("AVAILABLE", True, "RECOMMENDATION_AVAILABLE")),
+    ("QUEUED, still not eligible -> no event",              T("QUEUED", eligible=False),                   ("QUEUED", False, None)),
+    ("QUEUED, no longer matches -> WITHDRAWN",              T("QUEUED", matches=False, eligible=False),    ("WITHDRAWN", False, "RECOMMENDATION_WITHDRAWN")),
+    ("AVAILABLE, unchanged -> no event, no badge",          T("AVAILABLE", fp="A", notified="A"),          ("AVAILABLE", False, None)),
+    ("VIEWED, unchanged -> stays VIEWED",                   T("VIEWED", fp="A", notified="A", viewed="A"), ("VIEWED", False, None)),
+    ("VIEWED, content changed -> AVAILABLE + badge once",   T("VIEWED", fp="B", notified="A", viewed="A"), ("AVAILABLE", True, "RECOMMENDATION_REFRESHED")),
+    ("AVAILABLE, consent withdrawn -> WITHDRAWN",           T("AVAILABLE", eligible=False),                ("WITHDRAWN", False, "RECOMMENDATION_WITHDRAWN")),
+    ("VIEWED, employer unverified -> WITHDRAWN",            T("VIEWED", eligible=False),                   ("WITHDRAWN", False, "RECOMMENDATION_WITHDRAWN")),
+    ("WITHDRAWN, still ineligible -> no event",             T("WITHDRAWN", eligible=False),                ("WITHDRAWN", False, None)),
+    ("WITHDRAWN -> restored, unchanged, was viewed -> VIEWED, no badge", T("WITHDRAWN", fp="A", notified="A", viewed="A"), ("VIEWED", False, "RECOMMENDATION_RESTORED")),
+    ("WITHDRAWN -> restored, unchanged, never viewed -> AVAILABLE, no badge", T("WITHDRAWN", fp="A", notified="A"), ("AVAILABLE", False, "RECOMMENDATION_RESTORED")),
+    ("WITHDRAWN -> restored with changed content -> badge once", T("WITHDRAWN", fp="B", notified="A"),    ("AVAILABLE", True, "RECOMMENDATION_AVAILABLE")),
+]
+bad = [(name, got, want) for name, got, want in cases if got != want]
+c.ok("processing", not bad, f"recommendation status rules: {len(cases)} transitions as specified {bad}")
+c.ok("security", all(s in ("QUEUED", "AVAILABLE", "VIEWED", "WITHDRAWN") for _, got, _ in cases if got for s in [got[0]]),
+     "transitions never produce DELIVERED (reserved for a future messaging integration)")
+
+result = MatchResult(candidate=None, passed=True, reason="", semantic_percentage=91.3, distance_miles=7.9,
+                     matched_skills=["python", "sql", "Jane Doe", "Acme Corp"])
+profile = recs.anonymized_profile("Python Developer", result)
+c.ok("security", set(profile) == set(recs.PROFILE_KEYS) and profile["qualifications"] == ["python", "sql"],
+     "anonymized profile has only allow-listed keys; qualifications limited to the fixed dictionary")
+c.ok("security", profile["score_band"] == "85+" and profile["distance_band"] == "5-10 mi" and "91.3" not in json.dumps(profile) and "7.9" not in json.dumps(profile),
+     "exact score and distance are never included, only bands")
+c.ok("processing", [recs.score_band(x) for x in (49.9, 50, 69.99, 70, 84.9, 85)] == ["below 50", "50-69", "50-69", "70-84", "70-84", "85+"]
+     and [recs.distance_band(x) for x in (0, 4.99, 5, 9.9, 10, 24.9, 25, 49.9, 50)] == ["under 5 mi", "under 5 mi", "5-10 mi", "5-10 mi", "10-25 mi", "10-25 mi", "25-50 mi", "25-50 mi", "50+ mi"],
+     "score and distance band boundaries")
+fp1 = recs.profile_fingerprint(profile, 1)
+c.ok("processing", fp1 == recs.profile_fingerprint(dict(reversed(list(profile.items()))), 1) and fp1 != recs.profile_fingerprint(profile, 2)
+     and fp1 != recs.profile_fingerprint({**profile, "score_band": "70-84"}, 1),
+     "fingerprint: stable for identical content (key order irrelevant), changes with resume version or visible content")
+
 c.summary()

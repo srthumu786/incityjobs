@@ -159,7 +159,8 @@ def build_push_payload(job: JobCriteria, result: MatchResult, logged_at: str) ->
         "engine": "3-way-candidate-push",
         "delivery_status": "NOT_SENT_GATEWAY_PENDING",
         "push_targets": ["candidate", "employer", "platform_ledger"],
-        "candidate": {"profile_id": c.profile_id, "name": c.name, "contact_email": c.contact_email, "target_role": c.role},
+        # Internal ledger: reference the candidate by id only (no name or email copied)
+        "candidate": {"profile_id": c.profile_id},
         "employer": {"employer_id": job.employer_id, "company_name": job.company_name, "contact_email": job.employer_email},
         "job": {"job_id": job.job_id, "title": job.title, "department": job.department,
                 "worksite_coordinates": [job.latitude, job.longitude], "radius_miles": job.radius_miles},

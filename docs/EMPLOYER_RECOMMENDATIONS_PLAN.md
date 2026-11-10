@@ -59,7 +59,7 @@ Production is untouched, nothing is merged into `main`, and no external notifica
 | Opaque reference | Name, email, phone, street address, city, state, ZIP, exact coordinates |
 | The employer's own job title | Free-text role, resume text, employers, schools, dates, URLs |
 | Qualifications from the fixed matching dictionary | Exact score, exact distance |
-| Score band (`50–69`, `70–84`, `85+`) and distance band (`<5`, `5–10`, `10–25`, `25–50` mi) | Internal ledger payloads (`semantic_matches.payload`) |
+| Score band (`50-69`, `70-84`, `85+`) and distance band (`under 5`, `5-10`, `10-25`, `25-50`, `50+` mi) | Internal ledger payloads (`semantic_matches.payload`) |
 
 Free-text fields are never shown, even redacted, because they can carry indirect identifiers. New ledger payloads also stop copying the candidate's name and email.
 
