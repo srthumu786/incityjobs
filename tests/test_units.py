@@ -170,4 +170,33 @@ c.ok("processing", fp1 == recs.profile_fingerprint(dict(reversed(list(profile.it
      and fp1 != recs.profile_fingerprint({**profile, "score_band": "70-84"}, 1),
      "fingerprint: stable for identical content (key order irrelevant), changes with resume version or visible content")
 
+
+# ------------------------------------------------------------------ matching engine: pinned behaviour (docs/MATCHING_ENGINE_ASSESSMENT.md)
+import inspect
+import matching
+from matching_eval_set import evaluate
+
+# Exact current results. If the engine is changed on purpose, update these AND the
+# assessment document together; an accidental change fails here.
+PINNED = {
+    ("Software developer", "short (qualified)"): 74.16, ("Software developer", "realistic (qualified)"): 37.30, ("Software developer", "unqualified"): 0.00,
+    ("Warehouse / forklift", "short (qualified)"): 73.99, ("Warehouse / forklift", "realistic (qualified)"): 18.98, ("Warehouse / forklift", "unqualified"): 3.01,
+    ("CDL truck driver", "short (qualified)"): 72.11, ("CDL truck driver", "realistic (qualified)"): 18.23, ("CDL truck driver", "unqualified"): 5.55,
+    ("Registered nurse", "short (qualified)"): 87.67, ("Registered nurse", "realistic (qualified)"): 21.06, ("Registered nurse", "unqualified"): 3.01,
+    ("Retail cashier", "short (qualified)"): 74.85, ("Retail cashier", "realistic (qualified)"): 6.54, ("Retail cashier", "unqualified"): 0.00,
+    ("Welder", "short (qualified)"): 78.77, ("Welder", "realistic (qualified)"): 22.42, ("Welder", "unqualified"): 0.00,
+    ("Administrative assistant", "short (qualified)"): 80.90, ("Administrative assistant", "realistic (qualified)"): 12.40, ("Administrative assistant", "unqualified"): 8.73,
+}
+evaluation = evaluate()
+drift = [(r["occupation"], r["resume"], r["score"], PINNED[(r["occupation"], r["resume"])]) for r in evaluation
+         if abs(r["score"] - PINNED[(r["occupation"], r["resume"])]) > 0.005]
+c.ok("matching", len(evaluation) == len(PINNED) and drift == [], f"matching engine unchanged: all 21 assessment scores identical {drift}")
+by_kind = lambda k: [r for r in evaluation if r["resume"] == k]
+c.ok("matching", sum(r["passes"] for r in by_kind("short (qualified)")) == 7 and sum(r["passes"] for r in by_kind("realistic (qualified)")) == 0
+     and sum(r["passes"] for r in by_kind("unqualified")) == 0,
+     "documented behaviour: short summaries 7/7 match, realistic qualified resumes 0/7 (length penalty), unqualified 0/7")
+c.ok("matching", matching.MIN_SEMANTIC_SCORE == 50.0 and len(matching.Phase4SemanticEngine().skill_keywords) == 11
+     and "aws" in matching.Phase4SemanticEngine().skill_keywords,
+     "documented parameters unchanged: 50% threshold, 11-term tech dictionary")
+
 c.summary()

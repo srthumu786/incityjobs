@@ -410,7 +410,8 @@ cjob_count = max(len(f) for f in cjob_frames if f and "Match strength" in f[0])
 c.ok("isolation", eligible_cjob > 20 and cjob_count == 20, f"at most 20 per job shown ({eligible_cjob} eligible -> {cjob_count} shown)")
 
 # --- opening a profile: VIEWED, audited once, badge cleared; no repeat logging on rerun
-target = sorted(apex_shown)[0]
+current_rows, _ = dashboard(APEX_SESSION)  # pick a reference that is displayed NOW (refs are random; the cap above reorders)
+target = current_rows[0]["Candidate"].split()[0]
 c.ok("status", run("Employer Portal", clicks={f"open_rec_{target}"}) == "rerun" and view_events(target) == 1
      and q(f"SELECT status || '|' || is_new FROM employer_recommendations WHERE employer_ref = '{target}'") == "VIEWED|false",
      "employer opens a profile -> VIEWED, badge cleared, one PROFILE_VIEWED audit row", debug)

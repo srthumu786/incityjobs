@@ -5,7 +5,7 @@ cluster. They never connect to Neon or any network database.
 
 | Suite | What it covers |
 |---|---|
-| `test_units.py` | Diagnostic codes and log redaction (URI passwords, `password=`, configured secrets, emails, hashes; traceback included), password hashing, signed session tokens, credential fingerprints (session revocation), setup codes, matching rules, legacy-fallback exclusion. No database. |
+| `test_units.py` | Recommendation status rules, anonymized-profile allow-list, bands and fingerprints; the matching engine's pinned behaviour (`docs/MATCHING_ENGINE_ASSESSMENT.md`, set in `matching_eval_set.py`); diagnostic codes and log redaction (URI passwords, `password=`, configured secrets, emails, hashes; traceback included), password hashing, signed session tokens, credential fingerprints (session revocation), setup codes, matching rules, legacy-fallback exclusion. No database. |
 | `test_migration.py` | Starts from the schema the current `main` creates (`fixtures/legacy_main_schema.sql`) with messy data (mixed-case/space-padded duplicate emails, NULL/blank emails, fallback-point rows). Checks: dry run changes nothing; migration keeps every legacy row byte-identical; duplicates block the UNIQUE constraint and are reported; catalog verification catches wrong or non-unique indexes; `check_migration.py --apply` only reports completion after verification and a rolled-back probe. |
 | `test_e2e.py` | Runs the whole `app.py` on a simulated Streamlit runtime against the real local database, starting from a legacy copy so the app's own startup migration runs. Covers forged/expired/wrong-role tokens, unverified employers, verification and revocation, session revocation on credential change (employers and managers), setup codes, lockout, geocoding without fallback, candidate privacy, XSS escaping, live matching vs simulation, legacy-fallback exclusion, telemetry, System Checks. |
 | `test_diagnostics.py` | Startup diagnostics: missing `connection_string` and invalid credentials -> ICJ-ERR-500; migration failure -> ICJ-ERR-511; a real duplicate-check query failure -> ICJ-ERR-504. Startup errors are never relabeled by the page that hit them (checked from registration, sign-in and candidate intake). Server log has the traceback with secrets and emails redacted; users see only a plain message, the code and what to do; telemetry still records request-level failures. |
@@ -39,10 +39,11 @@ The runner:
 Expected last lines:
 
 ```
-unit tests: 32/32 passed (...)
-migration tests: 27/27 passed (...)
+unit tests: 41/41 passed (...)
+migration tests: 34/34 passed (...)
 end-to-end tests: 69/69 passed (...)
 diagnostics tests: 33/33 passed (...)
+recommendation tests: 59/59 passed (...)
 ALL SUITES PASSED
 ```
 

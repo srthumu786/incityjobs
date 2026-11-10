@@ -13,7 +13,12 @@ The final commit ID is reported with the review submission (this file is part of
 | `263836d` | Employer auth, signed manager sessions, UNIQUE emails, no geocode fallback, live vs simulated matching |
 | `566c2f0` | Review requirements 1–7 below |
 | `a08c2d5` | Registration confirmation shows only confirmed facts; regression test |
-| *(latest)* | Startup diagnostics: ICJ-ERR-500/511 separated from ICJ-ERR-504, redacted server logging |
+| `bf820e6` | Startup diagnostics: ICJ-ERR-500/511 separated from ICJ-ERR-504, redacted server logging |
+| `783e39a` | Approved Employer Recommended Candidates plan |
+| `c20a682` | Consent and append-only audit foundation |
+| `5501ddd` | Recommendation backend: generation, statuses, anonymization, concurrency |
+| `5ab72c5` | Employer Recommended Candidates dashboard with strict isolation |
+| *(latest)* | Matching engine assessment across occupations (engine unchanged) |
 
 ## Review requirements → changes
 | # | Requirement | Change | Files |
@@ -25,6 +30,16 @@ The final commit ID is reported with the review submission (this file is part of
 | 5 | Verify DB uniqueness before "complete" | After creating (or repairing) each UNIQUE index, the system catalog is checked: unique, valid, ready, live, on `lower(btrim(email))`, with the NULL/blank predicate. `report["complete"]` is true only if both pass. `check_migration.py --apply` also runs a rolled-back duplicate-insert probe and prints `MIGRATION COMPLETE` (exit 0) only then. Wrong same-named indexes are rebuilt when there are no duplicates, or reported as `invalid_index` when there are. | `db_schema.py`, `scripts/check_migration.py`, `app.py` |
 | 6 | PR document on the branch | This file | `docs/PR_db-pooling-tables.md` |
 | 7 | Staging manual | Private staging app on a Neon test branch, step by step, with teardown and production cut-over | `docs/STAGING_DEPLOYMENT.md` |
+
+## Employer Recommended Candidates (approved plan: `docs/EMPLOYER_RECOMMENDATIONS_PLAN.md`)
+- **Consent:** opt-in at registration, off by default, with timestamp and policy version. Revocable by the candidate in their own session, or recorded by a manager at the candidate's request. Existing candidates stay QUEUED until they consent. Contact disclosure has its own flag, which defaults to off and is never used in this phase.
+- **Statuses:** QUEUED, AVAILABLE, VIEWED and WITHDRAWN. DELIVERED is reserved for a future messaging integration and rejected by the database.
+- **Generation:** runs on job publish, candidate save, consent changes and verification changes, with the matching engine unchanged. It's idempotent and safe under concurrent runs.
+- **Employers:** a third Employer Portal tab, for verified employers only, showing their own jobs, at most 20 per job. Profiles are anonymised (allow-list: opaque reference, job title, dictionary qualifications, score band, distance band), with no search or export.
+- **Access checks:** every read re-checks live eligibility, so withdrawing consent or revoking verification blocks access immediately.
+- **Audit:** an append-only `privacy_audit_log` records consent, visibility, views, denied attempts and withdrawals. The database rejects UPDATE, DELETE and TRUNCATE on it.
+- **Ledger:** new `semantic_matches` payloads reference candidates by id only.
+- **Matching engine:** unchanged. Its weaknesses are documented with reproducible evidence in `docs/MATCHING_ENGINE_ASSESSMENT.md`. Realistic one-page resumes score 6.5–37% against the 50% threshold, so recommendations will be rare until the engine is extended.
 
 ## Startup diagnostics (follow-up from the staging incident)
 On staging, a wrong database password was reported as ICJ-ERR-504, the employer duplicate-check code. Errors are now classified by the operation that failed (`diagnostics.py`):
@@ -51,13 +66,14 @@ The block shown after a successful employer registration claimed things that wer
 - Verified by `tests/test_migration.py`: row counts plus an md5 over every original column of every table are identical before and after the migration, and after re-running it.
 
 ## Test evidence
-Run: `bash tests/run_local.sh` (throwaway PostgreSQL 16.15, Unix socket only, SCRAM password auth)
+Run: `bash tests/run_local.sh` (throwaway PostgreSQL 16.15, Unix socket only, UTF-8, SCRAM password auth)
 ```
-unit tests:        32/32 passed (security 23/23, processing 6/6, data 3/3)
-migration tests:   27/27 passed (data 22/22, security 5/5)
-end-to-end tests:  69/69 passed (security 40/40, data 14/14, processing 15/15)
-diagnostics tests: 33/33 passed (classification 12/12, logging 5/5, security 9/9, data 4/4, processing 1/1, telemetry 2/2)
-ALL SUITES PASSED   (161/161)
+unit tests:           41/41 passed (security 26/26, processing 9/9, data 3/3, matching 3/3)
+migration tests:      34/34 passed (data 24/24, security 10/10)
+end-to-end tests:     69/69 passed (security 40/40, data 14/14, processing 15/15)
+diagnostics tests:    33/33 passed (classification 12/12, logging 5/5, security 9/9, data 4/4, processing 1/1, telemetry 2/2)
+recommendation tests: 59/59 passed (consent 11/11, audit 5/5, security 10/10, generation 2/2, duplicates 6/6, status 10/10, anonymization 7/7, concurrency 4/4, isolation 4/4)
+ALL SUITES PASSED   (236/236)
 ```
 
 ## Not verified yet (needs the staging app)
