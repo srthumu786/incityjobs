@@ -110,6 +110,10 @@ for label, token in forgeries.items():
 # ================================================================== registration -> unverified (no posting privileges)
 new_session()
 run("Employer Portal", employer_form(pw="short"), {REGISTER})
+# K1 regression: the registration form makes no payment, settlement or Stripe claim (none is integrated)
+PAYMENT_CLAIMS = ["Stripe", "Settlement", "settlement", "Deferred", "API Deferred Frameworks"]
+c.ok("security", not [t for t in texts() for w in PAYMENT_CLAIMS if w in t],
+     f"K1: registration form shows no payment/settlement claims {[t for t in texts() for w in PAYMENT_CLAIMS if w in t]}", debug)
 c.ok("security", count("beta_employers") == 0, "weak password (<12 chars) rejected at registration")
 run("Employer Portal", employer_form(pw2="different-pass-99"), {REGISTER})
 c.ok("security", count("beta_employers") == 0, "mismatched password confirmation rejected")
@@ -177,6 +181,8 @@ run("Employer Portal", job_form(city="SERVICEDOWN"), {PUBLISH})
 c.ok("data", count("employer_jobs") == 1 and any("ICJ-ERR-506" in t for t in texts("warning"))
      and count("system_telemetry_logs", "diagnostic_error_code = 'ICJ-ERR-506'") == 1, "geocoder outage: NOT saved, ICJ-ERR-506 shown and logged")
 run("Employer Portal", job_form(), {PUBLISH})
+c.ok("processing", "✅ Job published." in texts("success") and not any("NEON" in t or "DEPLOYED" in t for t in texts()),
+     "K3: publish confirmation is a plain 'Job published' with no infrastructure claims", debug)
 job = q("SELECT id || '|' || employer_id || '|' || latitude || '|' || longitude || '|' || source_channel FROM employer_jobs WHERE title = 'Python Developer';")
 APEX_JOB = int(job.split("|")[0])
 c.ok("processing", job.endswith(f"|{APEX}|34.5251|-86.8947|employer_portal"), f"job saved with employer_id + geocoded coordinates: {job}")
@@ -283,6 +289,11 @@ run("Employee Portal", candidate_form(city="SERVICEDOWN"), {LOCK})
 c.ok("data", count("candidate_profiles", "contact_email = 'jane@x.com'") == 0 and any("ICJ-ERR-503" in t for t in texts("warning")),
      "geocoder outage: candidate NOT saved, ICJ-ERR-503")
 run("Employee Portal", candidate_form(name="<script>alert(1)</script>Jane"), {LOCK})
+# K2 regression: candidates never see (and the candidate query never reads) the employer's fee tier
+c.ok("security", any("MATCH FOUND" in t for t in texts()) and not texts("metric")
+     and not any(w in t for t in texts() for w in ("Billing", "Tier 1", "$300", "Fee Locked"))
+     and not any("pricing_tier" in s_ for s_ in sql_log()),
+     "K2: candidate match cards show no fee tier, and the candidate-side query does not read pricing_tier", debug)
 row = q("SELECT id || '|' || application_status FROM candidate_profiles WHERE contact_email = 'jane@x.com';")
 JANE = int(row.split("|")[0])
 c.ok("processing", row.endswith("|PENDING"), "candidate saved with normalized contact_email and PENDING status")

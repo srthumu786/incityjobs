@@ -1253,8 +1253,8 @@ elif page_selection == "Employer Portal":
             reg_password = st.text_input("Create Employer Password (at least 12 characters)", type="password")
             reg_password_confirm = st.text_input("Repeat Employer Password", type="password")
 
-            st.markdown("### 📜 Step 2: Platform Compliance & API Deferred Frameworks")
-            st.info("Deferred 14-Day Settlement active via Stripe framework parameters upon validation.")
+            # K1: no payment integration exists, so the form makes no payment or settlement claim.
+            st.markdown("### 📜 Step 2: Terms of Service and signature")
             agree_check = st.checkbox("I explicitly agree to the National Terms of Service.")
             raw_sign = st.text_input("Type Authorized Representative Full Name to Sign")
 
@@ -1385,7 +1385,7 @@ elif page_selection == "Employer Portal":
                                       "employer_portal", None, employer_id, job_requirements.strip(), match_radius))
                                 new_job_id = cursor.fetchone()[0]
 
-                            st.success("🎉 **JOB REQUISITION SYSTEM DEPLOYED LIVE TO NEON CLUSTER!**")
+                            st.success("✅ Job published.")  # K3: plain wording, no infrastructure claims
                             refresh_recommendations("job", new_job_id, "employer_portal.job_requisition.recommendations",
                                                     actor_type="employer", actor_ref=str(employer_id))
                             st.json({
@@ -1437,9 +1437,10 @@ elif page_selection == "Employee Portal":
 
                 # Active jobs only: posted by a VERIFIED employer, with real (geocoded)
                 # coordinates. Historical fallback-point and unattributed jobs are kept
-                # in the table but excluded here.
+                # in the table but excluded here. K2: the employer's fee tier is not
+                # read here, so it can never be shown to candidates.
                 cursor.execute(f"""
-                    SELECT j.title, j.department, j.pricing_tier, j.address, j.latitude, j.longitude, j.match_radius_miles
+                    SELECT j.title, j.department, j.address, j.latitude, j.longitude, j.match_radius_miles
                     FROM employer_jobs j
                     JOIN beta_employers e ON e.id = j.employer_id AND e.verified_at IS NOT NULL
                     WHERE j.latitude IS NOT NULL AND j.longitude IS NOT NULL
@@ -1465,7 +1466,7 @@ elif page_selection == "Employee Portal":
 
                 match_found = False
                 for job in active_jobs:
-                    j_title, j_dept, j_price, j_addr, j_lat, j_lon, j_radius = job
+                    j_title, j_dept, j_addr, j_lat, j_lon, j_radius = job
                     distance_miles = geodesic_miles(cand_coords, (j_lat, j_lon))
 
                     # Each job's own match radius (25 miles for jobs posted before radii existed)
@@ -1480,7 +1481,6 @@ elif page_selection == "Employee Portal":
                                 st.write(f"**Worksite Location:** {j_addr}")
                                 st.write(f"**Distance Allocation:** {round(distance_miles, 2)} active miles.")
                             with col2:
-                                st.metric(label="System Billing Value", value=str(j_price))
                                 st.success("🎯 Match Status: High Proximity Verified")
 
                 # 🔥 STEP 3.5 VISUALIZATION LAYOUT: Render the interactive geospatial dot map canvas
