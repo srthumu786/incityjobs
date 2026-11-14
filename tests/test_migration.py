@@ -74,8 +74,9 @@ before = fingerprint(DB)
 
 # 1. Dry run changes nothing
 r = run_check()
-c.ok("data", r.returncode == 1 and "DRY RUN" in r.stdout and "'hiring@legacy.com' x2" in r.stdout,
-     "preflight dry run reports the case/whitespace duplicate and exits 1", r.stdout)
+c.ok("data", r.returncode == 1 and "DRY RUN" in r.stdout and "duplicate group 1: x2 (row ids" in r.stdout
+     and "@" not in r.stdout.split("Migration", 1)[1],
+     "preflight dry run reports the case/whitespace duplicate (as a group with row ids, no address) and exits 1", r.stdout)
 c.ok("data", sql(DB, "SELECT count(*) FROM information_schema.columns WHERE table_name='beta_employers' AND column_name='verified_at'") == "0"
      and fingerprint(DB) == before, "dry run: no schema change, every legacy row byte-identical")
 

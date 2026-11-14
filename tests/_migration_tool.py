@@ -41,15 +41,31 @@ def scenario(**changes):
     return s
 
 
+def ca_bundle():
+    """A real trusted CA bundle from this machine (the Neon API stand-in still makes no network
+    call; the local test database adapter does no TLS, so the bundle is checked by the tool and
+    loaded into a real ssl context, and its use is recorded for the database connection)."""
+    import ssl
+    for path in ("/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", ssl.get_default_verify_paths().cafile or ""):
+        if path and os.path.isfile(path):
+            return path
+    raise SystemExit("No system CA bundle found for the tests; set one at /etc/ssl/certs/ca-certificates.crt")
+
+
 def default_args(db):
     return ["--neon-project-id", PROJECT, "--production-endpoint", PROD_EP, "--expect-endpoint", STAGING_EP,
-            "--expect-branch", "staging-test-gate", "--expect-database", db]
+            "--expect-branch", "staging-test-gate", "--expect-database", db, "--ca-file", ca_bundle()]
 
 
-def run(db, *args, url=None, scen=None, key=API_KEY, guard=True, break_probe=False):
-    """Returns (exit code, output, log lines). log lines show 'api <path>' and 'db connect'."""
+def good_url(sslmode="verify-full"):
     user, pw = os.environ.get("PGSHIM_USER", "postgres"), os.environ["PGPASSWORD"]
-    url = url or f"postgresql://{user}:{pw}@{STAGING_EP}-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+    query = f"?sslmode={sslmode}" if sslmode else ""
+    return f"postgresql://{user}:{pw}@{STAGING_EP}-pooler.c-2.us-east-2.aws.neon.tech/neondb{query}"
+
+
+def run(db, *args, url=None, scen=None, key=API_KEY, guard=True, break_probe=False, env_extra=None):
+    """Returns (exit code, output, log lines). log lines show 'api <path>' and 'db connect ...'."""
+    url = url or good_url()
     tmp = tempfile.mkdtemp(dir=os.environ["PGSHIM_HOST"])
     scen_file, log_file = os.path.join(tmp, "scenario.json"), os.path.join(tmp, "log.txt")
     json.dump(scen or DEFAULT_SCENARIO, open(scen_file, "w"))
@@ -61,6 +77,7 @@ def run(db, *args, url=None, scen=None, key=API_KEY, guard=True, break_probe=Fal
         env["NEON_API_KEY"] = key
     if break_probe:
         env["FAKE_BREAK_PROBE"] = "1"
+    env.update(env_extra or {})
     argv = (default_args(db) if guard else []) + list(args)
     code = ("import sys, runpy, fake_neon_api; "
             f"sys.argv = ['check_migration.py'] + {argv!r}; "

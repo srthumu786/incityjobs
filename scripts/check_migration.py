@@ -4,15 +4,18 @@ Run this against a Neon *test branch* or a local database, never against product
 See docs/STAGING_DEPLOYMENT.md.
 
     pip install -r requirements.txt
-    read -rs INCITY_DB_URL && export INCITY_DB_URL      # TEST branch owner string (hidden)
+    read -rs INCITY_DB_URL                              # TEST branch owner string (hidden)
+    INCITY_DB_URL="${INCITY_DB_URL/sslmode=require/sslmode=verify-full}"; export INCITY_DB_URL
     read -rs NEON_API_KEY && export NEON_API_KEY        # Neon API key (hidden; revoke it afterwards)
-    python scripts/check_migration.py --neon-project-id <project id> \\
+    python scripts/check_migration.py --neon-project-id <project id> --ca-file <trusted CA bundle (PEM)> \\
         --production-endpoint ep-PROD... --expect-endpoint ep-TEST... --expect-branch <test branch name>
     # add --apply to apply; without it the run is a dry run that always rolls back
 
 Target verification, all BEFORE connecting to the database (any failure: exit 2, nothing contacted):
   1. the connection string's host must be a well-formed Neon host (ep-...[-pooler].<region>.aws|azure.neon.tech)
-     and its sslmode, if given, must be require, verify-ca or verify-full;
+     and it must say sslmode=verify-full (missing or weaker modes are refused); --ca-file must be an
+     existing PEM bundle. The database connection is then forced to sslmode=verify-full with that
+     bundle as sslrootcert (certificate AND host name verified); the Neon API call uses the same bundle;
   2. its endpoint id must equal --expect-endpoint and must not equal --production-endpoint;
   3. Neon's API is asked, independently of the ids typed above, which branch serves that endpoint:
      the endpoint must belong to --neon-project-id, be read-write and enabled, and have exactly the
@@ -25,10 +28,21 @@ verified active AND the probe proves enforcement does --apply commit. Otherwise 
 failed or invalid index, a probe failure, any error) the whole transaction is rolled back and no
 schema change is kept. A dry run performs the same steps except the probe, and always rolls back.
 
+After a commit, a read-only re-verification runs. If it fails, the migration has ALREADY been
+committed: a committed transaction cannot be rolled back automatically, and this tool does not try
+to undo it. It exits 3 and says so; do not re-run. Restore the branch from the backup branch made
+before the run, or report the output for a decision.
+
+Output is meant to be shareable: it passes through the same redaction as the app's logs (emails,
+passwords, connection-string secrets, password hashes), duplicate emails are shown only as group
+numbers with row ids, and database errors are shown as type, SQLSTATE and a redacted message.
+
 Exit codes:
     0  dry run: the migration would complete / apply: committed and re-verified
-    1  not complete: nothing was committed (or, after a commit, re-verification failed: report it)
+    1  not complete or an error before commit: nothing was committed
     2  usage error, or refused by target verification (nothing was contacted)
+    3  committed, but the read-only re-verification failed: the commit stands (cannot be undone
+       automatically); restore from the backup branch or report the output
 """
 import argparse
 import json
@@ -44,10 +58,11 @@ from urllib.parse import parse_qs, quote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import psycopg2  # noqa: E402
 import db_schema  # noqa: E402
+from diagnostics import redact  # noqa: E402  (the app's own log redaction; no Streamlit import)
 
 NEON_API = "https://console.neon.tech/api/v2"
 NEON_HOST = re.compile(r"^(ep-[a-z0-9]+(?:-[a-z0-9]+)*?)(-pooler)?\.(?:c-\d+\.)?[a-z0-9]+(?:-[a-z0-9]+)*\.(?:aws|azure)\.neon\.tech$")
-STRONG_SSLMODES = {"require", "verify-ca", "verify-full"}
+REQUIRED_SSLMODE = "verify-full"
 NEW_COLUMNS = ("employer_matching_consent", "employer_matching_consent_at", "employer_matching_consent_policy",
                "contact_disclosure_consent", "resume_version")
 
@@ -60,9 +75,10 @@ def parse_target(db_url: str) -> dict:
         parts = urlsplit(text)
         query = parse_qs(parts.query)
         return {"host": (parts.hostname or "").lower(), "sslmode": (query.get("sslmode") or [""])[0],
-                "dbname": parts.path.lstrip("/") or ""}
+                "sslrootcert": (query.get("sslrootcert") or [""])[0], "dbname": parts.path.lstrip("/") or ""}
     pairs = dict(re.findall(r"(\w+)\s*=\s*'?([^\s']*)'?", text))
-    return {"host": pairs.get("host", "").lower(), "sslmode": pairs.get("sslmode", ""), "dbname": pairs.get("dbname", "")}
+    return {"host": pairs.get("host", "").lower(), "sslmode": pairs.get("sslmode", ""),
+            "sslrootcert": pairs.get("sslrootcert", ""), "dbname": pairs.get("dbname", "")}
 
 
 def endpoint_of(db_url: str) -> str:
@@ -74,7 +90,21 @@ def _norm(endpoint):
     return (endpoint or "").strip().lower().removesuffix("-pooler")
 
 
-def static_guard(db_url, production, expected):
+def ca_file_problem(ca_file):
+    if not ca_file:
+        return "--ca-file is required (a trusted CA bundle in PEM format)"
+    if not os.path.isfile(ca_file):
+        return "the --ca-file does not exist"
+    try:
+        with open(ca_file, encoding="ascii", errors="ignore") as fh:
+            if "-----BEGIN CERTIFICATE-----" not in fh.read(2_000_000):
+                return "the --ca-file is not a PEM certificate bundle"
+    except OSError:
+        return "the --ca-file cannot be read"
+    return None
+
+
+def static_guard(db_url, production, expected, ca_file=None):
     """Checks that need no network. Returns None or the refusal reason."""
     target = parse_target(db_url)
     production, expected = _norm(production), _norm(expected)
@@ -86,8 +116,14 @@ def static_guard(db_url, production, expected):
         return "--expect-endpoint and --production-endpoint are the same"
     if not NEON_HOST.match(target["host"]):
         return "the target host is not a well-formed Neon host (ep-...[-pooler].<region>.aws|azure.neon.tech)"
-    if target["sslmode"] and target["sslmode"] not in STRONG_SSLMODES:
-        return f"sslmode={target['sslmode']} is too weak (use require, verify-ca or verify-full)"
+    if target["sslmode"] != REQUIRED_SSLMODE:
+        return (f"sslmode={target['sslmode'] or '(missing)'} is not allowed: the connection string must say "
+                f"sslmode={REQUIRED_SSLMODE}")
+    problem = ca_file_problem(ca_file)
+    if problem:
+        return problem
+    if target["sslrootcert"] and os.path.abspath(os.path.expanduser(target["sslrootcert"])) != os.path.abspath(ca_file):
+        return "the connection string names a different sslrootcert than --ca-file"
     found = endpoint_of(db_url)
     if found == production:
         return f"the target endpoint {found} IS the production endpoint"
@@ -185,20 +221,57 @@ def post_commit_problems(conn) -> list:
     return problems
 
 
-def print_report(report, applying):
+_DETAIL_VALUES = (
+    # PostgreSQL error details quote row values, e.g. Key (lower(btrim(admin_email)))=(a@b.c) already exists.
+    (re.compile(r"(\bKey \(.*?\)=\()[^\n]*?(\)(?: already exists| is duplicated|\.|$))", re.MULTILINE), r"\1<redacted>\2"),
+    (re.compile(r"(?i)(failing row contains \().*?(\)\.?$)", re.MULTILINE), r"\1<redacted>\2"),
+)
+
+
+class Output:
+    """Every line this tool prints goes through here: the app's redaction (emails, passwords,
+    connection-string secrets, password hashes), plus row values quoted in database errors,
+    plus the exact secrets of this run (database password, Neon API key)."""
+
+    def __init__(self, secrets=()):
+        self.secrets = tuple(s for s in secrets if s)
+
+    def __call__(self, text=""):
+        out = redact(str(text), self.secrets)
+        for pattern, replacement in _DETAIL_VALUES:
+            out = pattern.sub(replacement, out)
+        print(out)
+
+
+def db_password(db_url):
+    text = (db_url or "").strip()
+    if text.startswith(("postgres://", "postgresql://")):
+        return urlsplit(text).password or ""
+    m = re.search(r"(?:^|\s)password\s*=\s*'?([^\s']+)", text)
+    return m.group(1) if m else ""
+
+
+def describe_error(exc):
+    first = (str(exc).strip().splitlines() or [""])[0]
+    code = getattr(exc, "pgcode", None)
+    return f"{type(exc).__name__}" + (f" (SQLSTATE {code})" if code else "") + (f": {first}" if first else "")
+
+
+def print_report(say, report, applying):
     for table, entry in report["constraints"].items():
         verification = entry["verification"]
-        print(f"{table}.{entry['column']}: UNIQUE constraint -> {entry['status']}"
-              f" (catalog verification: {'active' if verification['active'] else 'NOT active'})")
-        print(f"   {json.dumps(entry['profile'])}")
-        for email_key, copies, ids in entry["duplicates"]:
-            print(f"   duplicate: {email_key!r} x{copies} (row ids {ids})")
+        say(f"{table}.{entry['column']}: UNIQUE constraint -> {entry['status']}"
+            f" (catalog verification: {'active' if verification['active'] else 'NOT active'})")
+        say(f"   {json.dumps(entry['profile'])}")
+        for n, (_email_key, copies, ids) in enumerate(entry["duplicates"], 1):
+            # The duplicated address itself is never printed; look the row ids up privately if needed.
+            say(f"   duplicate group {n}: x{copies} (row ids {ids})")
         for problem in verification["problems"]:
             if problem != "index does not exist" or applying:
-                print(f"   verification: {problem}")
+                say(f"   verification: {problem}")
         if entry.get("error"):
-            print(f"   error: {entry['error']}")
-    print(f"\nHistorical rows at the old fallback point (kept, excluded from matching): {report['legacy_fallback_rows']}")
+            say(f"   error: {entry['error']}")
+    say(f"\nHistorical rows at the old fallback point (kept, excluded from matching): {report['legacy_fallback_rows']}")
 
 
 def main() -> int:
@@ -210,25 +283,34 @@ def main() -> int:
     parser.add_argument("--expect-endpoint", required=True, help="the TEST branch endpoint id (ep-...)")
     parser.add_argument("--expect-branch", required=True, help="the TEST branch name, e.g. staging-test-gate")
     parser.add_argument("--expect-database", default="neondb", help="database the connection must land in (default neondb)")
-    parser.add_argument("--ca-file", help="CA bundle for the Neon API's TLS check if the system store is not found")
+    parser.add_argument("--ca-file", required=True,
+                        help="trusted CA bundle (PEM) used to verify both the PostgreSQL server and the Neon API")
     args = parser.parse_args()
+    api_key = os.environ.get("NEON_API_KEY")
+    say = Output((db_password(args.db_url), api_key))
     if not args.db_url:
-        print("Set INCITY_DB_URL or pass --db-url (use a Neon test branch, not production).")
+        say("Set INCITY_DB_URL or pass --db-url (use a Neon test branch, not production).")
         return 2
+    ca_file = os.path.abspath(os.path.expanduser(args.ca_file))
 
-    refused = static_guard(args.db_url, args.production_endpoint, args.expect_endpoint)
+    refused = static_guard(args.db_url, args.production_endpoint, args.expect_endpoint, ca_file)
     if not refused:
         refused, facts = api_guard(args.db_url, args.neon_project_id, args.production_endpoint, args.expect_endpoint,
-                                   args.expect_branch, os.environ.get("NEON_API_KEY"), args.ca_file)
+                                   args.expect_branch, api_key, ca_file)
     if refused:
-        print(f"Refused before connecting: {refused}. Nothing was contacted or changed.")
+        say(f"Refused before connecting: {refused}. Nothing was contacted or changed.")
         return 2
-    print(f"Target endpoint: {endpoint_of(args.db_url)}; Neon confirms branch {facts['branch']!r} ({facts['branch_id']}), "
-          f"not default, not primary, created as {facts['init_source']!r} from {facts['parent_id']}; "
-          f"production endpoint serves {facts['production_branch_id']}.")
+    say(f"Target endpoint: {endpoint_of(args.db_url)}; Neon confirms branch {facts['branch']!r} ({facts['branch_id']}), "
+        f"not default, not primary, created as {facts['init_source']!r} from {facts['parent_id']}; "
+        f"production endpoint serves {facts['production_branch_id']}.")
+    say(f"TLS: sslmode={REQUIRED_SSLMODE}, sslrootcert={ca_file} (server certificate and host name verified)")
 
-    conn = psycopg2.connect(args.db_url, connect_timeout=10)
-    probe, committed = None, False
+    probe, committed, problems, report = None, False, [], None
+    try:
+        conn = psycopg2.connect(args.db_url, connect_timeout=10, sslmode=REQUIRED_SSLMODE, sslrootcert=ca_file)
+    except psycopg2.Error as exc:
+        say(f"Could not connect: {describe_error(exc)}. Nothing was changed.")
+        return 1
     try:
         with conn.cursor() as cur:
             cur.execute("SET LOCAL lock_timeout = '10s';")
@@ -237,7 +319,7 @@ def main() -> int:
             database = cur.fetchone()[0]
         if database != args.expect_database:
             conn.rollback()
-            print(f"Refused: connected to database {database!r}, expected {args.expect_database!r}. Nothing was changed.")
+            say(f"Refused: connected to database {database!r}, expected {args.expect_database!r}. Nothing was changed.")
             return 2
         report = db_schema.apply_schema(conn, commit=False)          # same transaction; nothing committed yet
         if args.apply and report["complete"]:
@@ -248,28 +330,42 @@ def main() -> int:
             committed = True
         else:
             conn.rollback()
-        problems = post_commit_problems(conn) if committed else []
+        if committed:
+            try:
+                problems = post_commit_problems(conn)
+            except psycopg2.Error as exc:
+                problems = [f"re-verification could not run: {describe_error(exc)}"]
+    except Exception as exc:  # before the commit: nothing is kept (the connection closes uncommitted)
+        if committed:
+            problems = [f"error after commit: {describe_error(exc)}"]
+        else:
+            say(f"ERROR before commit: {describe_error(exc)}")
+            say("\nMIGRATION NOT COMPLETE: nothing was committed; the transaction was rolled back.")
+            return 1
     finally:
-        conn.close()   # an exception before commit leaves the transaction uncommitted: PostgreSQL rolls it back
+        conn.close()   # an uncommitted transaction is rolled back by PostgreSQL when the connection closes
 
-    print(f"Migration {'APPLIED (committed as one transaction)' if committed else 'DRY RUN (rolled back, nothing changed)' if not args.apply else 'NOT APPLIED (rolled back, nothing changed)'}\n")
-    print_report(report, args.apply)
+    say(f"Migration {'APPLIED (committed as one transaction)' if committed else 'DRY RUN (rolled back, nothing changed)' if not args.apply else 'NOT APPLIED (rolled back, nothing changed)'}\n")
+    print_report(say, report, args.apply)
 
     if not args.apply:
         blocked = [t for t, e in report["constraints"].items() if e["status"] != "enforced"]
-        print("\nAll UNIQUE constraints can be enforced." if not blocked else
-              f"\nBlocked: {blocked}. Resolve the duplicates above, then run again. --apply would commit nothing.")
+        say("\nAll UNIQUE constraints can be enforced." if not blocked else
+            f"\nBlocked: {blocked}. Resolve the duplicates above, then run again. --apply would commit nothing.")
         return 0 if not blocked else 1
     if probe is not None:
-        print(f"Enforcement probe (inside the transaction, each attempt rolled back): {probe}")
+        say(f"Enforcement probe (inside the transaction, each attempt rolled back): {probe}")
     if not committed:
-        print("\nMIGRATION NOT COMPLETE: nothing was committed; the database is exactly as before.")
+        say("\nMIGRATION NOT COMPLETE: nothing was committed; the database is exactly as before.")
         return 1
     if problems:
-        print(f"\nMIGRATION COMMITTED BUT RE-VERIFICATION FAILED: {problems}. Stop and report this.")
-        return 1
-    print("\nMIGRATION COMPLETE: committed as one transaction, then re-verified "
-          "(uniqueness active, five consent columns, both tables, both audit triggers enabled).")
+        say(f"\nMIGRATION COMMITTED, BUT RE-VERIFICATION FAILED: {problems}.")
+        say("The migration is already committed. A committed transaction cannot be rolled back automatically, "
+            "and this tool will not try. Do not re-run it. Restore the branch from the backup branch made "
+            "before this run, or report this output for a decision.")
+        return 3
+    say("\nMIGRATION COMPLETE: committed as one transaction, then re-verified "
+        "(uniqueness active, five consent columns, both tables, both audit triggers enabled).")
     return 0
 
 

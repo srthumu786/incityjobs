@@ -57,8 +57,22 @@ _real_connect = psycopg2.connect
 
 
 def _connect(*args, **kwargs):
-    _log("db connect")
-    return _real_connect(*args, **kwargs)
+    _log(f"db connect sslmode={kwargs.get('sslmode')} sslrootcert={kwargs.get('sslrootcert')}")
+    conn = _real_connect(*args, **kwargs)
+    if os.environ.get("FAKE_DAMAGE_AFTER_COMMIT"):
+        # Simulate something going wrong right after a successful commit (e.g. another session
+        # dropping an object), so the post-commit re-verification fails.
+        real_commit = conn.commit
+
+        def commit():
+            real_commit()
+            import subprocess
+            subprocess.run(["psql", "-X", "-q", "-h", os.environ["PGSHIM_HOST"], "-p", os.environ.get("PGSHIM_PORT", "5432"),
+                            "-U", os.environ.get("PGSHIM_USER", "postgres"), "-d", os.environ["PGSHIM_DB"],
+                            "-c", "DROP TRIGGER privacy_audit_log_no_truncate ON privacy_audit_log;"], check=True,
+                           capture_output=True)
+        conn.commit = commit
+    return conn
 
 
 psycopg2.connect = _connect
@@ -67,3 +81,17 @@ if os.environ.get("FAKE_BREAK_PROBE"):
     # Simulate a uniqueness probe that does not see a unique violation (enforcement not proven).
     import db_schema
     db_schema.is_unique_violation = lambda exc: False
+
+if os.environ.get("FAKE_ERROR_WITH_PERSONAL_DATA"):
+    # Simulate a database error whose text quotes personal data, raised AFTER the migration
+    # statements ran inside the transaction (so a missing rollback would be visible).
+    import db_schema
+    _real_apply = db_schema.apply_schema
+
+    def _apply_then_fail(conn, commit=True):
+        _real_apply(conn, commit=False)
+        raise psycopg2.IntegrityError(
+            'duplicate key value violates unique constraint "uq_beta_employers_admin_email"\n'
+            "DETAIL:  Key (lower(btrim(admin_email)))=(leak.person@example.com) already exists.\n"
+            "CONTEXT: connection password=hunter2-secret-xyz", pgcode="23505")
+    db_schema.apply_schema = _apply_then_fail

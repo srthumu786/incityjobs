@@ -56,8 +56,12 @@ pip install -r requirements.txt
 
 read -rs INCITY_DB_URL && export INCITY_DB_URL   # paste the test-branch string from step 2 (hidden, not in history)
 
+# The connection must use sslmode=verify-full. Neon's string says sslmode=require; switch it in
+# memory (nothing is displayed). If the string has no sslmode at all, the tool will say so.
+INCITY_DB_URL="${INCITY_DB_URL/sslmode=require/sslmode=verify-full}"; export INCITY_DB_URL
 read -rs NEON_API_KEY && export NEON_API_KEY     # Neon API key, hidden; create it just before, revoke it after
-TARGET="--neon-project-id <PROJECT-ID> --production-endpoint ep-<PRODUCTION-ID> --expect-endpoint ep-<TEST-ID> --expect-branch <TEST-BRANCH-NAME>"
+CA="$(python3 -c 'import certifi; print(certifi.where())')"   # a trusted CA bundle (PEM)
+TARGET="--neon-project-id <PROJECT-ID> --production-endpoint ep-<PRODUCTION-ID> --expect-endpoint ep-<TEST-ID> --expect-branch <TEST-BRANCH-NAME> --ca-file $CA"
 
 # 3a. Dry run (one transaction, always rolled back). Before connecting, the tool checks the
 #     host format and asks Neon's API which branch serves the endpoint; it refuses production.
@@ -79,11 +83,17 @@ python scripts/check_migration.py $TARGET --apply
 unset NEON_API_KEY    # then revoke the key in the Neon Console
 ```
 
+Exit code 3 means the migration WAS committed but the read-only re-verification afterwards
+failed. A committed transaction cannot be rolled back automatically and the tool does not try:
+do not re-run it; restore the branch from the backup branch made before the run, or report the
+(redacted, shareable) output for a decision. The output never contains email addresses, row
+values from database errors, passwords or the API key.
+
 Expected end of output:
 ```
-Enforcement probe (rolled back): {'beta_employers': 'enforced', 'candidate_profiles': 'enforced'}
+Enforcement probe (inside the transaction, each attempt rolled back): {'beta_employers': 'enforced', 'candidate_profiles': 'enforced'}
 
-MIGRATION COMPLETE: database-level email uniqueness verified active.
+MIGRATION COMPLETE: committed as one transaction, then re-verified (uniqueness active, five consent columns, both tables, both audit triggers enabled).
 ```
 `--apply` declares completion only after (1) the system catalog confirms both UNIQUE indexes
 are unique/valid/ready/live on `lower(btrim(email))`, and (2) a probe inserting the same new email

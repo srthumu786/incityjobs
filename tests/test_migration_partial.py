@@ -19,7 +19,12 @@ then proves for scripts/check_migration.py (db_schema.py, the migration itself, 
 - a second --apply changes nothing;
 - scripts/schema_status.sql is read-only and flags a missing consent column, a missing
   trigger or a disabled trigger;
-- ON DELETE CASCADE removes a deleted job's recommendations but never audit history.
+- ON DELETE CASCADE removes a deleted job's recommendations but never audit history;
+- the PostgreSQL connection must be verify-full with a trusted CA bundle (missing or weaker
+  modes, a missing/invalid bundle, or a conflicting sslrootcert are refused before connecting);
+- shareable output is redacted (emails, quoted row values, passwords, API key, hashes), and
+  database errors are printed as type + SQLSTATE + redacted text;
+- a failed post-commit re-verification exits 3 and states the commit cannot be undone.
 """
 import os
 import re
@@ -130,17 +135,27 @@ c.ok("security", status(DB)[0] == before_status and snapshot(DB, ORIGINAL) == BE
 # ================================================================== target verification: refused BEFORE any database contact
 T, P = _migration_tool, f"/projects/{_migration_tool.PROJECT}"
 EP_PATH, BR_PATH, PROD_PATH = f"{P}/endpoints/{T.STAGING_EP}", f"{P}/branches/br-staging", f"{P}/endpoints/{T.PROD_EP}"
-good_url = f"postgresql://{USER}:{PW}@{T.STAGING_EP}-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+good_url = T.good_url()
+BAD_CA = os.path.join(os.environ["PGSHIM_HOST"], "not-a-ca.txt")
+open(BAD_CA, "w").write("just text\n")
+base_args = [a for a in T.default_args(DB) if a not in ("--ca-file", T.ca_bundle())]
 REFUSALS = [
     # (label, run kwargs, extra args, expected text) -- static checks (no network, no database)
     ("host is not a Neon host", {"url": f"postgresql://{USER}:{PW}@localhost/neondb"}, (), "not a well-formed Neon host"),
     ("look-alike host", {"url": f"postgresql://{USER}:{PW}@{T.STAGING_EP}.neon.tech.evil.example.com/neondb"}, (), "not a well-formed Neon host"),
-    ("weak sslmode", {"url": good_url.replace("sslmode=require", "sslmode=prefer")}, (), "too weak"),
+    ("sslmode missing", {"url": T.good_url(sslmode=None)}, (), "sslmode=(missing) is not allowed"),
+    ("sslmode=require", {"url": T.good_url("require")}, (), "sslmode=require is not allowed"),
+    ("sslmode=verify-ca", {"url": T.good_url("verify-ca")}, (), "sslmode=verify-ca is not allowed"),
+    ("sslmode=prefer", {"url": T.good_url("prefer")}, (), "sslmode=prefer is not allowed"),
+    ("no --ca-file", {"guard": False}, tuple(base_args), "--ca-file"),
+    ("--ca-file does not exist", {"guard": False}, tuple(base_args) + ("--ca-file", "/nonexistent/ca.pem"), "does not exist"),
+    ("--ca-file is not a PEM bundle", {"guard": False}, tuple(base_args) + ("--ca-file", BAD_CA), "not a PEM certificate bundle"),
+    ("connection string names another sslrootcert", {"url": good_url + "&sslrootcert=/tmp/other.pem"}, (), "different sslrootcert"),
     ("target IS production (URI)", {"url": good_url.replace(T.STAGING_EP, T.PROD_EP)}, (), "IS the production endpoint"),
-    ("target IS production (key=value DSN)", {"url": f"host={T.PROD_EP}-pooler.c-2.us-east-2.aws.neon.tech user={USER} password={PW} dbname=neondb"},
+    ("target IS production (key=value DSN)", {"url": f"host={T.PROD_EP}-pooler.c-2.us-east-2.aws.neon.tech user={USER} password={PW} dbname=neondb sslmode=verify-full"},
      (), "IS the production endpoint"),
     ("expected endpoint = production", {"guard": False}, ("--neon-project-id", T.PROJECT, "--production-endpoint", T.PROD_EP,
-     "--expect-endpoint", T.PROD_EP, "--expect-branch", "staging-test-gate"), "are the same"),
+     "--expect-endpoint", T.PROD_EP, "--expect-branch", "staging-test-gate", "--ca-file", T.ca_bundle()), "are the same"),
     ("target is another endpoint", {"url": good_url.replace(T.STAGING_EP, "ep-other-2222")}, (), "not the expected test endpoint"),
     ("missing required flags", {"guard": False}, ("--production-endpoint", T.PROD_EP), "required"),
     # API checks (network stand-in, still no database)
@@ -157,7 +172,8 @@ REFUSALS = [
     ("read-only endpoint", {"scen": T.scenario(patch={EP_PATH: {"type": "read_only"}})}, (), "not read-write"),
     ("disabled endpoint", {"scen": T.scenario(patch={EP_PATH: {"disabled": True}})}, (), "disabled"),
     ("wrong expected branch name", {"guard": False}, ("--neon-project-id", T.PROJECT, "--production-endpoint", T.PROD_EP,
-     "--expect-endpoint", T.STAGING_EP, "--expect-branch", "staging-review-db-pooling", "--expect-database", DB), "not 'staging-review-db-pooling'"),
+     "--expect-endpoint", T.STAGING_EP, "--expect-branch", "staging-review-db-pooling", "--expect-database", DB,
+     "--ca-file", T.ca_bundle()), "not 'staging-review-db-pooling'"),
 ]
 for mode in ((), ("--apply",)):
     for label, kw, extra, text in REFUSALS:
@@ -170,8 +186,9 @@ c.ok("security", code == 2 and "expected 'some_other_db'" in out and snapshot(DB
      "connected to an unexpected database name: refused before any change", out[-300:])
 code, out, log = _migration_tool.run(DB)
 c.ok("security", "Neon confirms branch 'staging-test-gate' (br-staging), not default, not primary, created as 'schema-only'" in out
-     and [line for line in log if line.startswith("api")] == [f"api {EP_PATH}", f"api {PROD_PATH}", f"api {BR_PATH}"] and log[-1] == "db connect",
-     "passing run: Neon is asked about the target endpoint, the production endpoint and the branch BEFORE connecting", (out[:400], log))
+     and [line for line in log if line.startswith("api")] == [f"api {EP_PATH}", f"api {PROD_PATH}", f"api {BR_PATH}"] and log[-1] == f"db connect sslmode=verify-full sslrootcert={T.ca_bundle()}"
+     and "TLS: sslmode=verify-full" in out,
+     "passing run: Neon is asked about the target endpoint, the production endpoint and the branch BEFORE connecting; the connection is forced to verify-full with the CA bundle", (out[:400], log))
 
 # ================================================================== dry run (point 1)
 code, out = check_migration(DB)
@@ -278,7 +295,7 @@ build_partial_state(DB2, duplicate=True)
 ORIG2 = {t: columns(DB2, t) for t in TABLES}
 ROWS2, OBJS2 = snapshot(DB2, ORIG2), objects(DB2)
 code, out = check_migration(DB2)
-c.ok("data", code == 1 and "duplicate: 'owner+k1@example.com' x2" in out and "--apply would commit nothing" in out
+c.ok("data", code == 1 and "duplicate group 1: x2 (row ids" in out and "owner+k1" not in out and "--apply would commit nothing" in out
      and snapshot(DB2, ORIG2) == ROWS2 and objects(DB2) == OBJS2,
      "dry run with a duplicate email: reported, blocked (exit 1), nothing changed", out)
 code, out = check_migration(DB2, "--apply")
@@ -296,5 +313,49 @@ code, out, _ = _migration_tool.run(DB5, "--apply", break_probe=True)
 c.ok("data", code == 1 and "Enforcement probe" in out and "enforced'" not in out.split("Enforcement probe")[1].split("\n")[0] and "nothing was committed" in out
      and snapshot(DB5, ORIG5) == ROWS5 and objects(DB5) == OBJS5,
      "--apply whose uniqueness probe cannot prove enforcement commits NOTHING", out[-500:])
+
+# ================================================================== redaction of shareable output (review point 3)
+DB6 = "partial_pii"
+build_partial_state(DB6)
+ORIG6 = {t: columns(DB6, t) for t in TABLES}
+ROWS6, OBJS6 = snapshot(DB6, ORIG6), objects(DB6)
+code, out, _ = _migration_tool.run(DB6, "--apply", env_extra={"FAKE_ERROR_WITH_PERSONAL_DATA": "1"})
+c.ok("security", code == 1 and "IntegrityError (SQLSTATE 23505)" in out and "leak.person" not in out and "hunter2-secret-xyz" not in out
+     and "Traceback" not in out and PW not in out and T.API_KEY not in out,
+     "a database error quoting an email and a password is printed as type + SQLSTATE + redacted text only", out[-500:])
+c.ok("data", "nothing was committed" in out and snapshot(DB6, ORIG6) == ROWS6 and objects(DB6) == OBJS6 and {t: columns(DB6, t) for t in TABLES} == ORIG6,
+     "...and the migration statements that had already run in that transaction were all rolled back")
+import importlib.util  # noqa: E402
+import builtins  # noqa: E402
+_spec = importlib.util.spec_from_file_location("check_migration_module", os.path.join(REPO, "scripts", "check_migration.py"))
+cm = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(cm)
+captured = []
+_real_print = builtins.print
+builtins.print = lambda *a, **k: captured.append(" ".join(str(x) for x in a))
+try:
+    say = cm.Output(("s3cr3t-db-pass", "neon-key-abcdef"))
+    for line in ["DETAIL:  Key (lower(btrim(admin_email)))=(jane.doe@example.com) already exists.",
+                 "DETAIL:  Failing row contains (7, Jane Doe, jane@x.com, 555-0100).",
+                 "postgresql://neondb_owner:s3cr3t-db-pass@ep-a.c-2.us-east-2.aws.neon.tech/neondb",
+                 "password=hunter2xyz and token neon-key-abcdef", "hash pbkdf2_sha256$600000$salt$digest"]:
+        say(line)
+finally:
+    builtins.print = _real_print
+joined = "\n".join(captured)
+c.ok("security", not any(x in joined for x in ("jane", "Jane", "555-0100", "s3cr3t-db-pass", "hunter2xyz", "neon-key-abcdef", "pbkdf2_sha256$600000"))
+     and "Key (lower(btrim(admin_email)))=(<redacted>)" in joined and "Failing row contains (<redacted>)" in joined,
+     "Output redacts emails, quoted row values (names, phone numbers), passwords, the API key and password hashes", joined)
+
+# ================================================================== post-commit verification cannot undo a commit (review point 2)
+DB7 = "partial_postcommit"
+build_partial_state(DB7)
+code, out, _ = _migration_tool.run(DB7, "--apply", env_extra={"FAKE_DAMAGE_AFTER_COMMIT": "1"})
+after7, _ = status(DB7)
+c.ok("processing", code == 3 and "MIGRATION COMMITTED, BUT RE-VERIFICATION FAILED" in out and "audit triggers missing or disabled" in out
+     and "cannot be rolled back automatically" in out and "Do not re-run" in out,
+     "a failed post-commit re-verification exits 3 and says the commit cannot be undone automatically", out[-600:])
+c.ok("data", after7.get("marker 8 recommendations table (c20a682, Nov 10)") == "present",
+     "...and, as documented, the committed migration stands (the tool does not try to undo it)")
 
 c.summary()
