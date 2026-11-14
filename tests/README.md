@@ -47,7 +47,7 @@ end-to-end tests: 72/72 passed (...)
 diagnostics tests: 33/33 passed (...)
 recommendation tests: 59/59 passed (...)
 db role tests: 69/69 passed (...)
-partial-migration tests: 20/20 passed (...)
+partial-migration tests: 33/33 passed (...)
 ALL SUITES PASSED
 ```
 

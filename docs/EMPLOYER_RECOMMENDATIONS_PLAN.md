@@ -84,6 +84,17 @@ A database trigger rejects `UPDATE`, `DELETE` and `TRUNCATE`. Rows hold ids, act
 | `privacy_audit_log` | New, append-only (trigger) |
 | `semantic_matches.payload` | New rows only: no candidate name or email |
 
+**Deletion behaviour (documented Nov 13, 2026).** `employer_recommendations` references the job, the
+employer and the candidate with `ON DELETE CASCADE`, deliberately. A recommendation is derived data
+(an anonymised summary of a candidate for one job), so it must not outlive any of the three records it
+summarises. For example, when a candidate's record is erased on request, no employer-facing summary
+of them can remain. The application never deletes rows itself (tested), and the restricted runtime
+role has no DELETE privilege, so the cascade acts only on a deliberate deletion by the owner or an
+administrator. `privacy_audit_log` has no foreign keys and keeps only ids, so its history is never
+removed by a cascade; it is append-only. If the owner prefers that deletions are blocked while
+recommendations exist, the alternative is `ON DELETE RESTRICT`, which would need a separately
+approved schema change.
+
 ## Tests
 - **Isolation:** cross-employer requests; forged session tokens, button keys and session state; unverified employers.
 - **Anonymisation:** direct and indirect identifiers. Every word of a candidate's name, contact details, address, free-text role and resume, apart from the fixed qualification dictionary, must be absent from employer output and stored profiles.

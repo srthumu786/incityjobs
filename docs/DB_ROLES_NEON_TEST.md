@@ -39,7 +39,7 @@ You need the same setup as `docs/STAGING_DEPLOYMENT.md` step 3 (Python and `requ
 
 ```bash
 export INCITY_DB_URL='<test-branch owner connection string>'
-python scripts/check_migration.py --apply                                  # if not already migrated
+python scripts/check_migration.py --production-endpoint ep-<PRODUCTION-ID> --expect-endpoint ep-<TEST-ID> --apply  # if not already migrated
 python scripts/apply_db_roles.py --production-endpoint ep-<PRODUCTION-ID>  # plan: changes nothing
 python scripts/apply_db_roles.py --production-endpoint ep-<PRODUCTION-ID> --apply
 python scripts/apply_db_roles.py --production-endpoint ep-<PRODUCTION-ID> --verify

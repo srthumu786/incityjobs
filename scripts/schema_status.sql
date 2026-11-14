@@ -17,12 +17,15 @@ SELECT * FROM (
     (4, '4 match ledger unique index (263836d, Nov 8)', to_regclass('public.uq_semantic_matches_candidate_job') IS NOT NULL),
     (5, '5 employer verification (566c2f0, Nov 8)', EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'beta_employers' AND column_name = 'verified_at')),
     (6, '6 unique email indexes (Nov 8)', to_regclass('public.uq_beta_employers_admin_email') IS NOT NULL AND to_regclass('public.uq_candidate_profiles_contact_email') IS NOT NULL),
-    (7, '7 consent columns (c20a682, Nov 10)', EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'candidate_profiles' AND column_name = 'employer_matching_consent')),
+    (7, '7 all five consent and version columns (c20a682, Nov 10)', (SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'candidate_profiles'
+          AND column_name IN ('employer_matching_consent', 'employer_matching_consent_at', 'employer_matching_consent_policy', 'contact_disclosure_consent', 'resume_version')) = 5),
     (8, '8 recommendations table (c20a682, Nov 10)', to_regclass('public.employer_recommendations') IS NOT NULL),
     (9, '9 privacy audit log table (c20a682, Nov 10)', to_regclass('public.privacy_audit_log') IS NOT NULL),
-    (10, '10 audit append-only triggers (c20a682, Nov 10)', EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'privacy_audit_log_append_only'))
+    (10, '10 both audit triggers present and enabled (c20a682, Nov 10)', (SELECT count(*) FROM pg_trigger WHERE tgrelid = to_regclass('public.privacy_audit_log') AND NOT tgisinternal
+          AND tgenabled <> 'D' AND tgname IN ('privacy_audit_log_append_only', 'privacy_audit_log_no_truncate')) = 2),
+    (11, '11 audit trigger function (c20a682, Nov 10)', EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'incity_reject_audit_change'))
   ) AS m(k, label, ok)
-  UNION ALL SELECT 14, 'recommendation or audit tables in any schema',
+  UNION ALL SELECT 15, 'recommendation or audit tables in any schema',
          coalesce(string_agg(n.nspname || '.' || c.relname, ', '), 'none')
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE c.relkind = 'r' AND c.relname IN ('employer_recommendations', 'privacy_audit_log')

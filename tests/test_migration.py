@@ -31,8 +31,10 @@ def fingerprint(db):
 
 
 def run_check(*args):
-    env = dict(os.environ, INCITY_DB_URL="postgresql://local-test-cluster")
-    return subprocess.run([sys.executable, CHECK_SCRIPT, *args], env=env, capture_output=True, text=True)
+    # The adapter ignores the host; the ep- host is what the endpoint guard checks.
+    env = dict(os.environ, INCITY_DB_URL="postgresql://ep-testbranch-1111-pooler.c-2.us-east-2.aws.neon.tech/neondb")
+    guard = ["--production-endpoint", "ep-prod-0000"] + (["--expect-endpoint", "ep-testbranch-1111"] if "--apply" in args else [])
+    return subprocess.run([sys.executable, CHECK_SCRIPT, *guard, *args], env=env, capture_output=True, text=True)
 
 
 def insert_fails_unique(conn, statement):

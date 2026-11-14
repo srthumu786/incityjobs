@@ -54,10 +54,11 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-export INCITY_DB_URL='<test-branch connection string from step 2>'
+read -rs INCITY_DB_URL && export INCITY_DB_URL   # paste the test-branch string from step 2 (hidden, not in history)
 
-# 3a. Read-only dry run (runs inside a transaction that is always rolled back)
-python scripts/check_migration.py
+# 3a. Read-only dry run (runs inside a transaction that is always rolled back).
+#     The endpoint guard refuses your production endpoint before connecting.
+python scripts/check_migration.py --production-endpoint ep-<PRODUCTION-ID>
 ```
 
 - **Exit 0** with `All UNIQUE constraints can be enforced.`: go to 3b.
@@ -69,8 +70,9 @@ python scripts/check_migration.py
   constraint stays off and System Checks will say so.)
 
 ```bash
-# 3b. Apply the migration and verify it
-python scripts/check_migration.py --apply
+# 3b. Apply the migration and verify it. --apply also requires the test endpoint id
+#     and refuses any other target.
+python scripts/check_migration.py --production-endpoint ep-<PRODUCTION-ID> --expect-endpoint ep-<TEST-ID> --apply
 ```
 
 Expected end of output:
