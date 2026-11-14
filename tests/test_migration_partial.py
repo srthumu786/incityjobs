@@ -1,0 +1,187 @@
+"""Completing a PARTLY migrated database (the staging state found on Nov 13, 2026).
+
+Staging-test-gate was migrated by code older than commit c20a682, so it has the Nov 8
+schema (passwords, verification, telemetry, unique emails) but not the consent columns,
+employer_recommendations or privacy_audit_log. This suite rebuilds that exact state with
+records in every table, plus two unrelated tables the app never touches, then proves that
+the existing, reviewed tool `scripts/check_migration.py` (code at a58a528, unchanged):
+
+- dry run: executes the whole migration on the real state, rolls back, changes nothing;
+- --apply: adds only the c20a682 objects; every existing table, column and row is
+  byte-identical afterwards; unrelated tables untouched; new consent fields default to
+  NO authorization; new tables empty; audit log append-only; email uniqueness still enforced;
+- a second --apply changes nothing (idempotent);
+- scripts/schema_status.sql reports MISSING before and present after, and is read-only;
+- a database with a duplicate email is reported, blocked and left with its rows intact.
+"""
+import os
+import subprocess
+import sys
+
+from _common import Checks, REPO, TESTS, fresh_db, load_legacy_schema, require_local_postgres, sql
+
+require_local_postgres()
+c = Checks("partial-migration tests")
+PW = os.environ["PGPASSWORD"]
+USER = os.environ.get("PGSHIM_USER", "postgres")
+DSN = f"postgresql://{USER}:{PW}@ep-testbranch-1111.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+PARTIAL = os.path.join(TESTS, "fixtures", "pre_c20a682_partial_schema.sql")
+STATUS_SQL = os.path.join(REPO, "scripts", "schema_status.sql")
+TABLES = ("beta_employers", "candidate_profiles", "employer_jobs", "semantic_matches",
+          "system_telemetry_logs", "unrelated_table_a", "unrelated_table_b")
+NEW_COLUMNS = {"employer_matching_consent", "employer_matching_consent_at", "employer_matching_consent_policy",
+               "contact_disclosure_consent", "resume_version"}
+
+
+def build_partial_state(db, duplicate=False):
+    fresh_db(db)
+    load_legacy_schema(db)
+    sql(db, open(PARTIAL, encoding="utf-8").read())
+    sql(db, f"""
+        INSERT INTO beta_employers (company_name, corporate_hq, admin_email, admin_phone, password_hash, verified_at, verified_by)
+          VALUES ('Owner Test Co', '1 Main St', 'owner+e1@example.com', '555', 'pbkdf2_sha256$600000$s$h', now(), 'admin'),
+                 ('Unverified Co', '2 Main St', 'owner+e2@example.com', '556', NULL, NULL, NULL);
+        INSERT INTO candidate_profiles (name, contact_email, role, resume, address, latitude, longitude, status)
+          VALUES ('Test Candidate', 'owner+k1@example.com', 'Dev', 'python sql', 'Priceville, AL', 34.5251, -86.8947, 'active_matching_pool'),
+                 ('Legacy Fallback', NULL, 'Dev', 'python', 'Unknown', 34.5262, -86.9556, 'active_matching_pool');
+        INSERT INTO employer_jobs (title, department, pricing_tier, address, latitude, longitude, employer_id, requirements)
+          VALUES ('Python Developer', 'Tech', 'Tier 1', '450 Logistics Blvd', 34.5251, -86.8947, 1, 'python sql');
+        INSERT INTO semantic_matches (candidate_profile_id, job_id, candidate_email, employer_email, match_score, status, payload)
+          VALUES (1, 1, 'owner+k1@example.com', 'owner+e1@example.com', 90, 'QUEUED_PENDING_GATEWAY', '{{"candidate": {{"profile_id": 1}}}}');
+        INSERT INTO system_telemetry_logs (diagnostic_error_code, error_context_vector, error_detail)
+          VALUES ('ICJ-ERR-504', 'employer_portal.registration.duplicate_check', 'staging incident');
+        CREATE TABLE unrelated_table_a (id SERIAL PRIMARY KEY, note TEXT);
+        CREATE TABLE unrelated_table_b (id SERIAL PRIMARY KEY, amount NUMERIC);
+        INSERT INTO unrelated_table_a (note) VALUES ('kept'), ('also kept');
+        INSERT INTO unrelated_table_b (amount) VALUES (1.50);
+    """)
+    if duplicate:
+        # A duplicate that the earlier code could not have accepted: insert it with the
+        # unique index removed, as a database migrated before uniqueness existed might hold.
+        sql(db, "DROP INDEX uq_candidate_profiles_contact_email;"
+                "INSERT INTO candidate_profiles (name, contact_email) VALUES ('Dup', ' OWNER+K1@example.com ');")
+
+
+def columns(db, table):
+    return sql(db, f"SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns "
+                   f"WHERE table_schema = 'public' AND table_name = '{table}';").split(",")
+
+
+def snapshot(db, original_columns):
+    """md5 of every row of every pre-existing table, over its ORIGINAL columns only."""
+    out = {}
+    for table, cols in original_columns.items():
+        col_list = ", ".join(f'"{c_}"' for c_ in cols)
+        out[table] = sql(db, f"SELECT count(*) || ':' || coalesce(md5(string_agg(t::text, '|' ORDER BY t::text)), '-') "
+                             f"FROM (SELECT {col_list} FROM {table}) t;")
+    return out
+
+
+def objects(db):
+    return sql(db, "SELECT string_agg(c.relkind::text || ':' || c.relname::text, ',' ORDER BY c.relname) FROM pg_class c "
+                   "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public';")
+
+
+def status(db):
+    out = subprocess.run(["psql", "-X", "-q", "-At", "-F", " | ", "-h", os.environ["PGSHIM_HOST"],
+                          "-p", os.environ.get("PGSHIM_PORT", "5432"), "-U", USER, "-d", db, "-f", STATUS_SQL],
+                         capture_output=True, text=True)
+    rows = {}
+    for line in out.stdout.splitlines():
+        parts = line.split(" | ", 2)
+        if len(parts) == 3:
+            rows[parts[1]] = parts[2]
+    return rows, out.returncode
+
+
+def check_migration(db, *args):
+    env = dict(os.environ, PGSHIM_DB=db, INCITY_DB_URL=DSN)
+    p = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "check_migration.py"), *args],
+                       capture_output=True, text=True, env=env)
+    return p.returncode, p.stdout + p.stderr
+
+
+# ================================================================== reproduce the staging state
+DB = "partial"
+build_partial_state(DB)
+ORIGINAL = {t: columns(DB, t) for t in TABLES}
+before_status, rc = status(DB)
+markers = {k: v for k, v in before_status.items() if k.startswith("marker")}
+c.ok("data", rc == 0 and [v for k, v in sorted(markers.items(), key=lambda kv: int(kv[0].split()[1]))] ==
+     ["present"] * 6 + ["MISSING"] * 4,
+     "fixture matches staging: markers 1-6 present, 7-10 (c20a682) missing", before_status)
+c.ok("data", "employer_recommendations" not in before_status.get("tables, all schemas", "")
+     and "public.system_telemetry_logs" in before_status.get("tables, all schemas", ""),
+     "fixture matches staging: telemetry table exists, recommendations table does not")
+BEFORE_ROWS, BEFORE_OBJECTS = snapshot(DB, ORIGINAL), objects(DB)
+c.ok("security", status(DB)[0] == before_status and snapshot(DB, ORIGINAL) == BEFORE_ROWS and objects(DB) == BEFORE_OBJECTS,
+     "schema_status.sql is read-only: running it changes nothing")
+
+# ================================================================== dry run
+code, out = check_migration(DB)
+c.ok("processing", code == 0 and "DRY RUN (rolled back, nothing changed)" in out and "All UNIQUE constraints can be enforced." in out,
+     "dry run on the partial state: whole migration executes, then rolls back", out)
+c.ok("data", snapshot(DB, ORIGINAL) == BEFORE_ROWS and objects(DB) == BEFORE_OBJECTS and
+     {t: columns(DB, t) for t in TABLES} == ORIGINAL, "dry run changed no table, column, index or row")
+
+# ================================================================== apply
+code, out = check_migration(DB, "--apply")
+c.ok("processing", code == 0 and "Migration APPLIED" in out and "MIGRATION COMPLETE" in out,
+     "--apply completes and verifies uniqueness (catalog + rolled-back probe)", out)
+after_status, _ = status(DB)
+c.ok("processing", all(v == "present" for k, v in after_status.items() if k.startswith("marker")),
+     "all ten markers present after --apply", after_status)
+c.ok("data", snapshot(DB, ORIGINAL) == BEFORE_ROWS,
+     "every pre-existing row byte-identical in its original columns (7 tables, incl. 2 unrelated)")
+added = {t: set(columns(DB, t)) - set(ORIGINAL[t]) for t in TABLES}
+c.ok("data", added == {**{t: set() for t in TABLES}, "candidate_profiles": NEW_COLUMNS},
+     f"only the 5 consent/version columns were added, all on candidate_profiles: {added}")
+c.ok("data", [columns(DB, t)[:len(ORIGINAL[t])] for t in TABLES] == [ORIGINAL[t] for t in TABLES],
+     "existing columns kept their names and order")
+new_objs = set(objects(DB).split(",")) - set(BEFORE_OBJECTS.split(","))
+expected_new = {"r:employer_recommendations", "r:privacy_audit_log", "S:employer_recommendations_id_seq",
+                "S:privacy_audit_log_id_seq", "i:employer_recommendations_pkey", "i:privacy_audit_log_pkey",
+                "i:employer_recommendations_employer_ref_key", "i:employer_recommendations_job_id_candidate_profile_id_key",
+                "i:idx_employer_recommendations_employer_status", "i:idx_employer_recommendations_candidate",
+                "i:idx_privacy_audit_log_candidate", "i:idx_privacy_audit_log_recommendation"}
+c.ok("data", new_objs == expected_new and set(BEFORE_OBJECTS.split(",")) <= set(objects(DB).split(",")),
+     f"only the c20a682 tables, sequences and indexes were added; nothing removed: {sorted(new_objs ^ expected_new)}")
+c.ok("security", sql(DB, "SELECT count(*) FILTER (WHERE employer_matching_consent OR contact_disclosure_consent "
+                         "OR employer_matching_consent_at IS NOT NULL OR employer_matching_consent_policy IS NOT NULL) "
+                         "|| '|' || count(*) FILTER (WHERE resume_version = 1) || '|' || count(*) FROM candidate_profiles;") == "0|2|2",
+     "existing candidates get NO consent (false/null) and resume_version 1")
+c.ok("data", sql(DB, "SELECT (SELECT count(*) FROM employer_recommendations) + (SELECT count(*) FROM privacy_audit_log);") == "0",
+     "new tables are empty (the uniqueness probe was rolled back)")
+sql(DB, "INSERT INTO privacy_audit_log (event_type, actor_type) VALUES ('TEST', 'system');")
+for label, stmt in {"UPDATE": "UPDATE privacy_audit_log SET event_type = 'X';",
+                    "DELETE": "DELETE FROM privacy_audit_log;", "TRUNCATE": "TRUNCATE privacy_audit_log;"}.items():
+    r = subprocess.run(["psql", "-X", "-q", "-At", "-h", os.environ["PGSHIM_HOST"], "-p", os.environ.get("PGSHIM_PORT", "5432"),
+                        "-U", USER, "-d", DB, "-c", stmt], capture_output=True, text=True)
+    c.ok("security", r.returncode != 0 and "append-only" in r.stderr, f"audit log refuses {label} after the migration")
+c.ok("security", subprocess.run(["psql", "-X", "-q", "-h", os.environ["PGSHIM_HOST"], "-p", os.environ.get("PGSHIM_PORT", "5432"),
+                                 "-U", USER, "-d", DB, "-c",
+                                 "INSERT INTO candidate_profiles (name, contact_email) VALUES ('x', ' Owner+K1@Example.com');"],
+                                capture_output=True, text=True).returncode != 0,
+     "email uniqueness still enforced after the migration")
+
+# ================================================================== idempotent
+AFTER_ROWS = snapshot(DB, {t: columns(DB, t) for t in TABLES})
+AFTER_OBJECTS = objects(DB)
+code, out = check_migration(DB, "--apply")
+c.ok("processing", code == 0 and "MIGRATION COMPLETE" in out
+     and snapshot(DB, {t: columns(DB, t) for t in TABLES}) == AFTER_ROWS and objects(DB) == AFTER_OBJECTS,
+     "a second --apply changes nothing", out)
+
+# ================================================================== duplicates block, rows kept
+DB2 = "partial_dup"
+build_partial_state(DB2, duplicate=True)
+ORIG2 = {t: columns(DB2, t) for t in TABLES}
+ROWS2 = snapshot(DB2, ORIG2)
+code, out = check_migration(DB2)
+c.ok("data", code == 1 and "duplicate: 'owner+k1@example.com' x2" in out and snapshot(DB2, ORIG2) == ROWS2,
+     "dry run with a duplicate email: reported, blocked (exit 1), nothing changed", out)
+code, out = check_migration(DB2, "--apply")
+c.ok("data", code == 1 and "MIGRATION NOT COMPLETE" in out and snapshot(DB2, ORIG2) == ROWS2,
+     "--apply with a duplicate: never declared complete; every existing row still intact", out)
+
+c.summary()

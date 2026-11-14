@@ -1,6 +1,6 @@
 # InCityJobs test suites
 
-Six suites, run together with one command against a **throwaway local PostgreSQL**
+Seven suites, run together with one command against a **throwaway local PostgreSQL**
 cluster. They never connect to Neon or any network database.
 
 | Suite | What it covers |
@@ -11,6 +11,7 @@ cluster. They never connect to Neon or any network database.
 | `test_diagnostics.py` | Startup diagnostics: missing `connection_string` and invalid credentials -> ICJ-ERR-500; migration failure -> ICJ-ERR-511; a real duplicate-check query failure -> ICJ-ERR-504. Startup errors are never relabeled by the page that hit them (checked from registration, sign-in and candidate intake). Server log has the traceback with secrets and emails redacted; users see only a plain message, the code and what to do; telemetry still records request-level failures. |
 | `test_recommendations.py` | Employer Recommended Candidates: opt-in consent (default off, revocable, audited), append-only audit, generation on every trigger, status rules, read-time eligibility guard, anonymization against direct and indirect identifiers, ledger privacy, 10-worker concurrency with consent withdrawals, employer isolation (cross-employer, forged clicks, forged session state, forged tokens, unverified employers), immediate effect of consent withdrawal and verification revocation, 20-per-job cap, no repeated notifications. |
 | `test_db_roles.py` | Least-privilege roles (`scripts/apply_db_roles.py`, `scripts/db_roles_grants.sql`) on a Neon-like setup (non-superuser `neondb_owner` owns everything): production-endpoint guard, plan mode, exact privilege matrix and drift detection, idempotent apply, allowed and refused statements for `icj_app` and `icj_readonly`, the current app under `icj_app` (ICJ-ERR-511, nothing written), the main workflows under `icj_app` with verify-only startup (simulated), and rollback leaving every row unchanged. |
+| `test_migration_partial.py` | Completing a partly migrated database (staging's Nov 13 state: Nov 8 schema, no c20a682 objects), starting from `fixtures/pre_c20a682_partial_schema.sql` with records in every table plus two unrelated tables. `scripts/check_migration.py` dry run changes nothing; `--apply` adds only the c20a682 columns, tables, indexes and triggers, keeps every existing row byte-identical, gives existing candidates no consent; second run changes nothing; a duplicate email blocks completion with rows intact; `scripts/schema_status.sql` is read-only. |
 
 ## Run them
 
@@ -34,7 +35,7 @@ bash tests/run_local.sh
 
 The runner:
 1. creates a new cluster in `/tmp/incity-pg.XXXXXX`, listening **only on a Unix socket** (no TCP), UTF-8 like Neon, with SCRAM password authentication and a random per-run password;
-2. runs `test_units.py`, `test_migration.py`, `test_e2e.py`, `test_diagnostics.py`, `test_recommendations.py`, `test_db_roles.py` (set `INCITY_SUITES` to run a subset);
+2. runs `test_units.py`, `test_migration.py`, `test_e2e.py`, `test_diagnostics.py`, `test_recommendations.py`, `test_db_roles.py`, `test_migration_partial.py` (set `INCITY_SUITES` to run a subset);
 3. stops the cluster and deletes the directory, even if a test fails.
 
 Expected last lines:
@@ -46,6 +47,7 @@ end-to-end tests: 72/72 passed (...)
 diagnostics tests: 33/33 passed (...)
 recommendation tests: 59/59 passed (...)
 db role tests: 69/69 passed (...)
+partial-migration tests: 20/20 passed (...)
 ALL SUITES PASSED
 ```
 
