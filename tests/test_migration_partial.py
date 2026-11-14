@@ -1,22 +1,25 @@
 """Completing a PARTLY migrated database (the staging state found on Nov 13, 2026).
 
-Staging-test-gate was migrated by code older than commit c20a682, so it has the Nov 8
-schema (passwords, verification, telemetry, unique emails) but not the consent columns,
-employer_recommendations or privacy_audit_log. This suite rebuilds that exact state with
-records in every table, plus two unrelated tables the app never touches, then proves that
-the existing, reviewed tool `scripts/check_migration.py` (code at a58a528, unchanged):
+Staging-test-gate was migrated by code older than commit c20a682, so it has the Nov 8 schema
+but not the consent columns, employer_recommendations or privacy_audit_log. This suite rebuilds
+that exact state with records in every table, plus two unrelated tables the app never touches,
+then proves for scripts/check_migration.py (db_schema.py, the migration itself, is unchanged):
 
-- dry run: executes the whole migration on the real state, rolls back, changes nothing;
-- --apply: adds only the c20a682 objects; every existing table, column and row is
-  byte-identical afterwards; unrelated tables untouched; new consent fields default to
-  NO authorization; new tables empty; audit log append-only; email uniqueness still enforced;
-- a second --apply changes nothing (idempotent);
-- scripts/schema_status.sql reports MISSING before and present after, is read-only, and flags
-  a missing consent column, a missing trigger or a disabled trigger;
-- the endpoint guard refuses production, unknown hosts and unexpected endpoints before connecting;
-- a failure part-way through the migration rolls back everything;
-- ON DELETE CASCADE removes a deleted job's recommendations but never audit history;
-- a database with a duplicate email is reported, blocked and left with its rows intact.
+- target verification refuses, before any database contact, every wrong target: a malformed or
+  look-alike host, weak sslmode, the production endpoint (URI and key=value), another endpoint,
+  a missing API key, an unreachable or refusing Neon API, and any Neon answer showing the
+  branch is production, default or primary, a different branch name, project, host, a
+  read-only or disabled endpoint, or a production endpoint on the same branch;
+- dry run: executes the whole migration, rolls back, changes nothing;
+- --apply: one transaction; commits only after catalog verification and an in-transaction
+  probe; adds only the c20a682 objects; every existing row byte-identical; unrelated tables
+  untouched; consent defaults to NO; audit log append-only; then re-verifies read-only;
+- all-or-nothing: a duplicate email, a probe that cannot prove enforcement, or a failure
+  part-way through all leave the database exactly as before;
+- a second --apply changes nothing;
+- scripts/schema_status.sql is read-only and flags a missing consent column, a missing
+  trigger or a disabled trigger;
+- ON DELETE CASCADE removes a deleted job's recommendations but never audit history.
 """
 import os
 import re
@@ -24,6 +27,7 @@ import subprocess
 import sys
 
 from _common import Checks, REPO, TESTS, fresh_db, load_legacy_schema, require_local_postgres, sql
+import _migration_tool
 
 require_local_postgres()
 c = Checks("partial-migration tests")
@@ -99,12 +103,10 @@ def status(db):
     return rows, out.returncode
 
 
-def check_migration(db, *args, guard=True, url=DSN):
-    env = dict(os.environ, PGSHIM_DB=db, INCITY_DB_URL=url)
-    flags = (["--production-endpoint", "ep-prod-0000"] + (["--expect-endpoint", "ep-testbranch-1111"] if "--apply" in args else [])) if guard else []
-    p = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "check_migration.py"), *flags, *args],
-                       capture_output=True, text=True, env=env)
-    return p.returncode, p.stdout + p.stderr
+def check_migration(db, *args, **kw):
+    """check_migration.py via the test-only Neon API stand-in. Returns (exit code, output)."""
+    code, out, _ = _migration_tool.run(db, *args, **kw)
+    return code, out
 
 
 def marker_values(rows):
@@ -125,19 +127,51 @@ BEFORE_ROWS, BEFORE_OBJECTS = snapshot(DB, ORIGINAL), objects(DB)
 c.ok("security", status(DB)[0] == before_status and snapshot(DB, ORIGINAL) == BEFORE_ROWS and objects(DB) == BEFORE_OBJECTS,
      "schema_status.sql is read-only: running it changes nothing")
 
-# ================================================================== endpoint guard (point 2): refused before connecting
-for label, args, kw in [
-        ("no --production-endpoint", (), {"guard": False}),
-        ("target IS production", ("--production-endpoint", "ep-testbranch-1111"), {"guard": False}),
-        ("--apply without --expect-endpoint", ("--production-endpoint", "ep-prod-0000", "--apply"), {"guard": False}),
-        ("--apply, wrong expected endpoint", ("--production-endpoint", "ep-prod-0000", "--expect-endpoint", "ep-other-2222", "--apply"), {"guard": False}),
-        ("host is not a Neon endpoint", ("--apply",), {"url": f"postgresql://{USER}:{PW}@localhost/neondb"}),
-        ("key=value DSN pointing at production", ("--production-endpoint", "ep-prod-0000"),
-         {"guard": False, "url": f"host=ep-prod-0000-pooler.c-2.us-east-2.aws.neon.tech user={USER} password={PW} dbname=neondb"})]:
-    code, out = check_migration(DB, *args, **kw)
-    c.ok("security", code == 2 and snapshot(DB, ORIGINAL) == BEFORE_ROWS and objects(DB) == BEFORE_OBJECTS
-         and ("Refused before connecting" in out or "required" in out) and PW not in out,
-         f"guard refuses ({label}); nothing contacted or changed; no password printed", out)
+# ================================================================== target verification: refused BEFORE any database contact
+T, P = _migration_tool, f"/projects/{_migration_tool.PROJECT}"
+EP_PATH, BR_PATH, PROD_PATH = f"{P}/endpoints/{T.STAGING_EP}", f"{P}/branches/br-staging", f"{P}/endpoints/{T.PROD_EP}"
+good_url = f"postgresql://{USER}:{PW}@{T.STAGING_EP}-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+REFUSALS = [
+    # (label, run kwargs, extra args, expected text) -- static checks (no network, no database)
+    ("host is not a Neon host", {"url": f"postgresql://{USER}:{PW}@localhost/neondb"}, (), "not a well-formed Neon host"),
+    ("look-alike host", {"url": f"postgresql://{USER}:{PW}@{T.STAGING_EP}.neon.tech.evil.example.com/neondb"}, (), "not a well-formed Neon host"),
+    ("weak sslmode", {"url": good_url.replace("sslmode=require", "sslmode=prefer")}, (), "too weak"),
+    ("target IS production (URI)", {"url": good_url.replace(T.STAGING_EP, T.PROD_EP)}, (), "IS the production endpoint"),
+    ("target IS production (key=value DSN)", {"url": f"host={T.PROD_EP}-pooler.c-2.us-east-2.aws.neon.tech user={USER} password={PW} dbname=neondb"},
+     (), "IS the production endpoint"),
+    ("expected endpoint = production", {"guard": False}, ("--neon-project-id", T.PROJECT, "--production-endpoint", T.PROD_EP,
+     "--expect-endpoint", T.PROD_EP, "--expect-branch", "staging-test-gate"), "are the same"),
+    ("target is another endpoint", {"url": good_url.replace(T.STAGING_EP, "ep-other-2222")}, (), "not the expected test endpoint"),
+    ("missing required flags", {"guard": False}, ("--production-endpoint", T.PROD_EP), "required"),
+    # API checks (network stand-in, still no database)
+    ("no Neon API key", {"key": None}, (), "NEON_API_KEY is not set"),
+    ("Neon API unreachable", {"scen": T.scenario(network_error=True)}, (), "could not be checked"),
+    ("Neon API rejects the key", {"scen": T.scenario(http_errors={EP_PATH: 401})}, (), "HTTP 401"),
+    ("branch name is production", {"scen": T.scenario(patch={BR_PATH: {"name": "production"}})}, (), "serves branch 'production'"),
+    ("branch is the default branch", {"scen": T.scenario(patch={BR_PATH: {"default": True}})}, (), "DEFAULT branch"),
+    ("branch is the primary branch", {"scen": T.scenario(patch={BR_PATH: {"primary": True}})}, (), "PRIMARY branch"),
+    ("production endpoint serves the same branch", {"scen": T.scenario(patch={PROD_PATH: {"branch_id": "br-staging"}})}, (), "same branch"),
+    ("Neon host differs from the host connected to", {"scen": T.scenario(patch={EP_PATH: {"host": "ep-testbranch-1111.c-9.eu-west-1.aws.neon.tech"}})},
+     (), "not the host being connected to"),
+    ("endpoint in another project", {"scen": T.scenario(patch={EP_PATH: {"project_id": "proj-other"}})}, (), "different Neon project"),
+    ("read-only endpoint", {"scen": T.scenario(patch={EP_PATH: {"type": "read_only"}})}, (), "not read-write"),
+    ("disabled endpoint", {"scen": T.scenario(patch={EP_PATH: {"disabled": True}})}, (), "disabled"),
+    ("wrong expected branch name", {"guard": False}, ("--neon-project-id", T.PROJECT, "--production-endpoint", T.PROD_EP,
+     "--expect-endpoint", T.STAGING_EP, "--expect-branch", "staging-review-db-pooling", "--expect-database", DB), "not 'staging-review-db-pooling'"),
+]
+for mode in ((), ("--apply",)):
+    for label, kw, extra, text in REFUSALS:
+        code, out, log = _migration_tool.run(DB, *extra, *mode, **kw)
+        c.ok("security", code == 2 and text in out and "db connect" not in log and PW not in out and T.API_KEY not in out
+             and snapshot(DB, ORIGINAL) == BEFORE_ROWS and objects(DB) == BEFORE_OBJECTS,
+             f"{' '.join(mode) or 'dry run'} refused, no database contact, nothing changed, no secret printed: {label}", (out[-400:], log))
+code, out, log = _migration_tool.run(DB, "--expect-database", "some_other_db")
+c.ok("security", code == 2 and "expected 'some_other_db'" in out and snapshot(DB, ORIGINAL) == BEFORE_ROWS and objects(DB) == BEFORE_OBJECTS,
+     "connected to an unexpected database name: refused before any change", out[-300:])
+code, out, log = _migration_tool.run(DB)
+c.ok("security", "Neon confirms branch 'staging-test-gate' (br-staging), not default, not primary, created as 'schema-only'" in out
+     and [line for line in log if line.startswith("api")] == [f"api {EP_PATH}", f"api {PROD_PATH}", f"api {BR_PATH}"] and log[-1] == "db connect",
+     "passing run: Neon is asked about the target endpoint, the production endpoint and the branch BEFORE connecting", (out[:400], log))
 
 # ================================================================== dry run (point 1)
 code, out = check_migration(DB)
@@ -148,8 +182,8 @@ c.ok("data", snapshot(DB, ORIGINAL) == BEFORE_ROWS and objects(DB) == BEFORE_OBJ
 
 # ================================================================== apply
 code, out = check_migration(DB, "--apply")
-c.ok("processing", code == 0 and "Migration APPLIED" in out and "MIGRATION COMPLETE" in out,
-     "--apply completes and verifies uniqueness (catalog + rolled-back probe)", out)
+c.ok("processing", code == 0 and "Migration APPLIED (committed as one transaction)" in out and "MIGRATION COMPLETE: committed as one transaction, then re-verified" in out,
+     "--apply commits once, only after catalog verification + in-transaction probe, then re-verifies read-only", out)
 after_status, _ = status(DB)
 c.ok("processing", marker_values(after_status) == ["present"] * 11,
      "all eleven markers present after --apply (five consent columns, both triggers enabled, function)", after_status)
@@ -238,16 +272,29 @@ app_sql = "".join(open(os.path.join(REPO, f), encoding="utf-8").read() for f in 
 c.ok("data", not re.search(r"\bDELETE\s+FROM\b|\bTRUNCATE\b", app_sql, re.IGNORECASE),
      "the application itself never deletes rows, so the cascade only acts on a deliberate owner/admin deletion")
 
-# ================================================================== duplicates block, rows kept
+# ================================================================== all-or-nothing: incomplete means NOTHING committed (point 2 of the review)
 DB2 = "partial_dup"
 build_partial_state(DB2, duplicate=True)
 ORIG2 = {t: columns(DB2, t) for t in TABLES}
-ROWS2 = snapshot(DB2, ORIG2)
+ROWS2, OBJS2 = snapshot(DB2, ORIG2), objects(DB2)
 code, out = check_migration(DB2)
-c.ok("data", code == 1 and "duplicate: 'owner+k1@example.com' x2" in out and snapshot(DB2, ORIG2) == ROWS2,
+c.ok("data", code == 1 and "duplicate: 'owner+k1@example.com' x2" in out and "--apply would commit nothing" in out
+     and snapshot(DB2, ORIG2) == ROWS2 and objects(DB2) == OBJS2,
      "dry run with a duplicate email: reported, blocked (exit 1), nothing changed", out)
 code, out = check_migration(DB2, "--apply")
-c.ok("data", code == 1 and "MIGRATION NOT COMPLETE" in out and snapshot(DB2, ORIG2) == ROWS2,
-     "--apply with a duplicate: never declared complete; every existing row still intact", out)
+c.ok("data", code == 1 and "MIGRATION NOT COMPLETE: nothing was committed" in out
+     and snapshot(DB2, ORIG2) == ROWS2 and objects(DB2) == OBJS2 and {t: columns(DB2, t) for t in TABLES} == ORIG2,
+     "--apply with a duplicate commits NOTHING: no new columns, tables, indexes or triggers; rows intact", out)
+c.ok("data", status(DB2)[0].get("marker 8 recommendations table (c20a682, Nov 10)") == "MISSING",
+     "after the refused --apply the c20a682 objects are still absent (not half-applied)")
+
+DB5 = "partial_probe"
+build_partial_state(DB5)
+ORIG5 = {t: columns(DB5, t) for t in TABLES}
+ROWS5, OBJS5 = snapshot(DB5, ORIG5), objects(DB5)
+code, out, _ = _migration_tool.run(DB5, "--apply", break_probe=True)
+c.ok("data", code == 1 and "Enforcement probe" in out and "enforced'" not in out.split("Enforcement probe")[1].split("\n")[0] and "nothing was committed" in out
+     and snapshot(DB5, ORIG5) == ROWS5 and objects(DB5) == OBJS5,
+     "--apply whose uniqueness probe cannot prove enforcement commits NOTHING", out[-500:])
 
 c.summary()

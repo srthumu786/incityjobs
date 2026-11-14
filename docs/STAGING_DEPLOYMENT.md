@@ -56,9 +56,12 @@ pip install -r requirements.txt
 
 read -rs INCITY_DB_URL && export INCITY_DB_URL   # paste the test-branch string from step 2 (hidden, not in history)
 
-# 3a. Read-only dry run (runs inside a transaction that is always rolled back).
-#     The endpoint guard refuses your production endpoint before connecting.
-python scripts/check_migration.py --production-endpoint ep-<PRODUCTION-ID>
+read -rs NEON_API_KEY && export NEON_API_KEY     # Neon API key, hidden; create it just before, revoke it after
+TARGET="--neon-project-id <PROJECT-ID> --production-endpoint ep-<PRODUCTION-ID> --expect-endpoint ep-<TEST-ID> --expect-branch <TEST-BRANCH-NAME>"
+
+# 3a. Dry run (one transaction, always rolled back). Before connecting, the tool checks the
+#     host format and asks Neon's API which branch serves the endpoint; it refuses production.
+python scripts/check_migration.py $TARGET
 ```
 
 - **Exit 0** with `All UNIQUE constraints can be enforced.`: go to 3b.
@@ -70,9 +73,10 @@ python scripts/check_migration.py --production-endpoint ep-<PRODUCTION-ID>
   constraint stays off and System Checks will say so.)
 
 ```bash
-# 3b. Apply the migration and verify it. --apply also requires the test endpoint id
-#     and refuses any other target.
-python scripts/check_migration.py --production-endpoint ep-<PRODUCTION-ID> --expect-endpoint ep-<TEST-ID> --apply
+# 3b. Apply: all-or-nothing. Commits only if every UNIQUE constraint is verified and the
+#     in-transaction probe proves enforcement; otherwise nothing is kept. Then re-verifies.
+python scripts/check_migration.py $TARGET --apply
+unset NEON_API_KEY    # then revoke the key in the Neon Console
 ```
 
 Expected end of output:

@@ -31,10 +31,11 @@ def fingerprint(db):
 
 
 def run_check(*args):
-    # The adapter ignores the host; the ep- host is what the endpoint guard checks.
-    env = dict(os.environ, INCITY_DB_URL="postgresql://ep-testbranch-1111-pooler.c-2.us-east-2.aws.neon.tech/neondb")
-    guard = ["--production-endpoint", "ep-prod-0000"] + (["--expect-endpoint", "ep-testbranch-1111"] if "--apply" in args else [])
-    return subprocess.run([sys.executable, CHECK_SCRIPT, *guard, *args], env=env, capture_output=True, text=True)
+    """check_migration.py through the test-only Neon API stand-in (tests/_migration_tool.py)."""
+    import types
+    import _migration_tool
+    code, out, _ = _migration_tool.run(os.environ["PGSHIM_DB"], *args)
+    return types.SimpleNamespace(returncode=code, stdout=out)
 
 
 def insert_fails_unique(conn, statement):
@@ -150,7 +151,7 @@ c.ok("security", probe == {"beta_employers": "enforced", "candidate_profiles": "
 c.ok("data", sql(DB, "SELECT (SELECT count(*) FROM beta_employers) || '/' || (SELECT count(*) FROM candidate_profiles)") == rows_before_probe,
      "probe rolled back (no rows left behind)")
 r = run_check("--apply")
-c.ok("data", r.returncode == 0 and "MIGRATION COMPLETE" in r.stdout and "Enforcement probe (rolled back): {'beta_employers': 'enforced', 'candidate_profiles': 'enforced'}" in r.stdout,
+c.ok("data", r.returncode == 0 and "MIGRATION COMPLETE" in r.stdout and "Enforcement probe (inside the transaction, each attempt rolled back): {'beta_employers': 'enforced', 'candidate_profiles': 'enforced'}" in r.stdout,
      "check_migration --apply prints MIGRATION COMPLETE only after catalog verification + probe", r.stdout)
 
 # ================================================================ tampered / wrong indexes are detected and repaired
