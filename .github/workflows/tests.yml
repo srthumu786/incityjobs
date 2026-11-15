@@ -1,0 +1,84 @@
+# InCityJobs test suites on a throwaway local PostgreSQL.
+#
+# Runs `bash tests/run_local.sh` (all seven suites) on a GitHub-hosted Ubuntu runner.
+# - No deployment, no merge, no Neon or production access: the tests create their own
+#   PostgreSQL cluster on a Unix socket (no TCP) and delete it afterwards; the Neon API is a
+#   local stand-in (tests/fake_neon_api.py).
+# - No secrets: this workflow references no repository secret and no environment; it refuses
+#   to run if database or Neon credentials appear in its environment.
+# - Least privilege: the token can only read repository contents, and checkout does not keep it.
+# - No privileged triggers: plain `pull_request` (forks get a read-only token and no secrets);
+#   never `pull_request_target` or `workflow_run`.
+# - One action only, GitHub's own actions/checkout, pinned to a full commit SHA.
+name: Tests
+
+on:
+  push:
+    branches: ["main", "fix/**", "p0/**"]
+  pull_request:
+    branches: ["main", "fix/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tests:
+    name: All seven test suites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the commit under test (token not kept in git config)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Refuse to run with database or Neon credentials in the environment
+        run: |
+          set -euo pipefail
+          for name in INCITY_DB_URL DATABASE_URL NEON_API_KEY PGPASSWORD PGHOST PGUSER PGDATABASE PGSERVICE PGPASSFILE; do
+            if [ -n "${!name:-}" ]; then
+              echo "::error::$name is set in the environment; this workflow must run without credentials."
+              exit 1
+            fi
+          done
+          if [ -f .streamlit/secrets.toml ]; then
+            echo "::error::.streamlit/secrets.toml is present in the checkout; refusing to run."
+            exit 1
+          fi
+          echo "No database or Neon credentials in the environment."
+
+      - name: Check Python 3.11+ and PostgreSQL 14+
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; print("Python", sys.version.split()[0]); sys.exit(0 if sys.version_info >= (3, 11) else 1)' \
+            || { echo "::error::Python 3.11 or newer is required"; exit 1; }
+          pg_bin="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$pg_bin" ] || [ ! -x "$pg_bin/initdb" ]; then
+            echo "PostgreSQL server binaries not preinstalled; installing the distribution package."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends postgresql
+            pg_bin="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)"
+          fi
+          version="$("$pg_bin/postgres" --version | awk '{print $3}')"
+          echo "PostgreSQL $version at $pg_bin"
+          [ "${version%%.*}" -ge 14 ] || { echo "::error::PostgreSQL $version is older than 14"; exit 1; }
+          echo "PG_BIN=$pg_bin" >> "$GITHUB_ENV"
+
+      - name: Run all seven suites (throwaway PostgreSQL, Unix socket only)
+        run: |
+          set -o pipefail
+          bash tests/run_local.sh 2>&1 | tee "$RUNNER_TEMP/test-output.txt"
+
+      - name: Report passes and failures
+        if: always()
+        run: python3 tests/ci_summary.py "$RUNNER_TEMP/test-output.txt" "$GITHUB_STEP_SUMMARY"

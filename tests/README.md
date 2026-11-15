@@ -76,3 +76,12 @@ ignores any connection string the app passes, so the suites can't reach Neon.
   `docs/STAGING_DEPLOYMENT.md`, step 7.
 - Real concurrent requests (races between two users submitting at once). The UNIQUE
   indexes are what protect against those.
+
+## Continuous integration
+
+`.github/workflows/tests.yml` runs `bash tests/run_local.sh` on a GitHub-hosted Ubuntu 24.04 runner on
+every push to `main`, `fix/**` and `p0/**`, on pull requests to `main` and `fix/**`, and on demand.
+It uses no repository secrets, no environments and no Neon access; the token is read-only
+(`contents: read`) and is not kept after checkout; the only action is GitHub's `actions/checkout`,
+pinned to a full commit SHA. `tests/ci_summary.py` writes a per-suite pass/fail table to the run's
+summary page and marks each failing check as an error annotation.
