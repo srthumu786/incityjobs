@@ -74,11 +74,14 @@ jobs:
           [ "${version%%.*}" -ge 14 ] || { echo "::error::PostgreSQL $version is older than 14"; exit 1; }
           echo "PG_BIN=$pg_bin" >> "$GITHUB_ENV"
 
+      - name: Self-test the results reporter (no database)
+        run: python3 tests/test_ci_summary.py
+
       - name: Run all seven suites (throwaway PostgreSQL, Unix socket only)
         run: |
           set -o pipefail
           bash tests/run_local.sh 2>&1 | tee "$RUNNER_TEMP/test-output.txt"
 
-      - name: Report passes and failures
+      - name: Report passes and failures (expected totals and final marker verified)
         if: always()
         run: python3 tests/ci_summary.py "$RUNNER_TEMP/test-output.txt" "$GITHUB_STEP_SUMMARY"

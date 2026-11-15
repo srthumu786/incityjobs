@@ -84,4 +84,17 @@ every push to `main`, `fix/**` and `p0/**`, on pull requests to `main` and `fix/
 It uses no repository secrets, no environments and no Neon access; the token is read-only
 (`contents: read`) and is not kept after checkout; the only action is GitHub's `actions/checkout`,
 pinned to a full commit SHA. `tests/ci_summary.py` writes a per-suite pass/fail table to the run's
-summary page and marks each failing check as an error annotation.
+summary page and marks each problem as an error annotation.
+
+The reporter accepts a run only if all seven suites appear once, in order, each with exactly the
+expected number of checks (41, 34, 72, 33, 59, 69, 90; 398 in all), all passed, with matching group
+counts and `PASS` lines, no `FAIL` line, and `ALL SUITES PASSED` as the last line. Zero checks, a
+missing or extra suite, truncated output and any failure are rejected. **When a suite gains or loses
+checks on purpose, update `EXPECTED` in `tests/ci_summary.py` in the same commit.**
+
+`tests/test_ci_summary.py` (51 checks, no database) tests the reporter on successful, incomplete,
+truncated and failed output; the workflow runs it before the suites:
+
+```
+python3 tests/test_ci_summary.py
+```
