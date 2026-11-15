@@ -3,7 +3,9 @@
 The whole app.py runs on a simulated Streamlit runtime (widgets, session state,
 reruns, cache_resource) against a REAL isolated local PostgreSQL database that
 starts as a legacy copy of production (tests/fixtures/legacy_main_schema.sql),
-so the app's own startup migration runs too. Geocoding is simulated: no network."""
+migrated first by the separate administrator step (db_schema.apply_schema, as
+scripts/check_migration.py --apply does); the app itself only checks the schema,
+read-only. Geocoding is simulated: no network."""
 import json
 import math
 import os
@@ -12,7 +14,7 @@ import sys
 import time
 import types
 
-from _common import Checks, REPO, fresh_db, load_legacy_schema, require_local_postgres, sql
+from _common import Checks, REPO, fresh_db, load_legacy_schema, migrate_as_administrator, require_local_postgres, sql
 
 require_local_postgres()
 import psycopg2  # local-only test adapter
@@ -29,6 +31,7 @@ VALUES ('Legacy Fallback Candidate', 'Dev', 'Python developer: sql, docker, micr
 INSERT INTO employer_jobs (title, department, pricing_tier, address, latitude, longitude)
 VALUES ('Legacy Fallback Job', 'Logistics', 'Tier 1', 'Unknown', 34.5262, -86.9556);
 """)
+migrate_as_administrator(DB)  # the app never migrates; an administrator does, before the app runs
 LEGACY_ROWS = sql(DB, "SELECT md5(string_agg(t::text, '|')) FROM (SELECT id, name, latitude, longitude FROM candidate_profiles ORDER BY id) t;")
 
 def q(text): return sql(DB, text)
@@ -89,7 +92,7 @@ run("Employer Portal", job_form(), {PUBLISH})
 c.ok("security", "job_requisition_form" not in ui.forms and "employer_sign_in_form" in ui.forms and count("employer_jobs") == 1,
      "signed-out employer: no job form, PUBLISH inserts nothing", debug)
 c.ok("data", q(f"SELECT md5(string_agg(t::text, '|')) FROM (SELECT id, name, latitude, longitude FROM candidate_profiles ORDER BY id) t;") == LEGACY_ROWS,
-     "app startup migration ran on the legacy copy without altering legacy rows")
+     "administrator migration of the legacy copy kept legacy rows unchanged; app startup (read-only check) changed nothing")
 
 # forged / tampered / wrong-role / expired employer tokens
 key = signing_key()

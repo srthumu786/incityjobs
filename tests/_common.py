@@ -42,6 +42,23 @@ def load_legacy_schema(db):
     sql(db, open(LEGACY_SCHEMA, encoding="utf-8").read())
 
 
+def migrate_as_administrator(db):
+    """Run the schema migration (db_schema.apply_schema, the code scripts/check_migration.py
+    --apply runs) on a test database, as the separate administrator step that precedes any
+    app use. The app itself never migrates. Returns the migration report."""
+    import psycopg2  # the local-only test adapter (tests/pg_adapter)
+    import db_schema
+    previous = os.environ.get("PGSHIM_DB")
+    os.environ["PGSHIM_DB"] = db
+    conn = psycopg2.connect("postgresql://local-test-administrator")
+    try:
+        return db_schema.apply_schema(conn)
+    finally:
+        conn.close()
+        if previous is not None:
+            os.environ["PGSHIM_DB"] = previous
+
+
 class Checks:
     """Collects results by group; stops at the first failure."""
 

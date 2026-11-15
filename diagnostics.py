@@ -33,7 +33,7 @@ DIAGNOSTIC_CODES = {
     "ICJ-ERR-508": "Employee proximity map query failed",
     "ICJ-ERR-509": "Manager console candidate read failed",
     "ICJ-ERR-510": "Manager console match logging failed",
-    "ICJ-ERR-511": "Database schema initialization or migration failed",
+    "ICJ-ERR-511": "Database schema check failed or schema not migrated for this app version (an administrator must run the migration; the app never migrates)",
     "ICJ-ERR-512": "Employer sign-in lookup failed",
     "ICJ-ERR-513": "Employer setup-code redemption failed",
     "ICJ-ERR-514": "Manager console job list failed",
@@ -67,8 +67,10 @@ class DatabaseConnectionError(StartupDiagnosticError):
 
 
 class SchemaMigrationError(StartupDiagnosticError):
+    """The read-only startup schema check failed, or found the schema not migrated.
+    (Name kept from when the app migrated on startup; it no longer does.)"""
     code = "ICJ-ERR-511"
-    stage = "startup.schema_migration"
+    stage = "startup.schema_check"
     user_message = ("⚠️ The service's database is being updated and can't accept changes right now, "
                     "so nothing was saved. Please try again later. If it keeps happening, contact "
                     "InCityJobs support and quote this code.")

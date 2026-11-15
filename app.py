@@ -68,9 +68,11 @@ def _configured_secret_values():
 install_redacting_filter(logger, _configured_secret_values)
 
 # ==============================================================================
-# 🗄️ CENTRALIZED DATABASE ACCESS (single pool + one-time schema setup)
+# 🗄️ CENTRALIZED DATABASE ACCESS (single pool + read-only schema check)
 # ==============================================================================
-# Production tables (schema and migrations live in db_schema.py):
+# Production tables (schema and migrations live in db_schema.py). The app only CHECKS
+# the schema (read-only); migrations are run by an administrator with
+# scripts/check_migration.py after explicit authorization, never by the app:
 #   beta_employers        - employer accounts       (Employer Portal)
 #   employer_jobs         - job requisitions        (Employer Portal, signed-in employers only)
 #   candidate_profiles    - candidate profiles      (Employee Portal + Manager Console)
@@ -132,34 +134,46 @@ def _release_connection(pool, conn):
 
 
 @st.cache_resource(show_spinner=False)
-def ensure_schema() -> dict:
-    """Create/migrate the production tables once per server process and return the
-    migration report. A failure is not cached, so the next request retries.
+def verify_schema() -> dict:
+    """READ-ONLY check, once per server process, that the database already has the
+    schema this app version needs. The app never migrates: schema changes are an
+    administrator operation (scripts/check_migration.py, explicitly authorized).
+    A failure is not cached, so the next request re-checks (e.g. after the
+    administrator has migrated). Returns db_schema.check_schema()'s report.
     Raises DatabaseConnectionError (ICJ-ERR-500) or SchemaMigrationError (ICJ-ERR-511)."""
     pool = _open_pool()
     conn = _open_connection(pool)
     try:
-        report = db_schema.apply_schema(conn)
+        try:
+            report = db_schema.check_schema(conn)  # READ ONLY transaction, always rolled back
+        except Exception as exc:
+            raise SchemaMigrationError(f"schema check failed ({type(exc).__name__})") from exc
+        if report["missing"]:
+            shown = report["missing"][:25]
+            more = f" and {len(report['missing']) - len(shown)} more" if len(report["missing"]) > len(shown) else ""
+            raise SchemaMigrationError("database schema is not migrated for this app version; an administrator "
+                                       f"must run scripts/check_migration.py. Missing: {'; '.join(shown)}{more}")
         if not report["complete"]:
             # Uniqueness is not verified active; app-level duplicate checks still run
             detail = "; ".join(
                 f"{t}.{e['column']}: {e['status']} ({len(e['duplicates'])} duplicate email groups; "
-                f"{', '.join(e['verification']['problems']) or 'verified'}"
-                f"{'; ' + e['error'] if e.get('error') else ''})"
-                for t, e in report["constraints"].items() if e["status"] != "enforced" or not e["verification"]["active"]
+                f"{', '.join(e['verification']['problems']) or 'verified'})"
+                for t, e in report["constraints"].items() if e["status"] != "enforced"
             )
             logger.warning("ICJ-ERR-518 [startup.schema.unique_email] %s", detail)
-            # Written directly: the normal telemetry path depends on this function
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO system_telemetry_logs (diagnostic_error_code, error_context_vector, error_detail) VALUES (%s, %s, %s);",
-                    ("ICJ-ERR-518", "startup.schema.unique_email", redact(detail, _configured_secret_values())),
-                )
-            conn.commit()
-    except Exception as exc:
-        if not conn.closed:
-            conn.rollback()
-        raise SchemaMigrationError(f"schema migration failed ({type(exc).__name__})") from exc
+            # A data row, not DDL, in its own normal transaction after the read-only check.
+            # Written directly: the normal telemetry path depends on this function.
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO system_telemetry_logs (diagnostic_error_code, error_context_vector, error_detail) VALUES (%s, %s, %s);",
+                        ("ICJ-ERR-518", "startup.schema.unique_email", redact(detail, _configured_secret_values())),
+                    )
+                conn.commit()
+            except Exception:
+                if not conn.closed:
+                    conn.rollback()
+                logger.exception("Could not write telemetry row for ICJ-ERR-518 [startup.schema.unique_email]")
     finally:
         _release_connection(pool, conn)
     return report
@@ -175,7 +189,7 @@ def get_db_cursor():
     Startup problems raise DatabaseConnectionError / SchemaMigrationError before
     the block runs; errors from the caller's own queries propagate unchanged.
     """
-    ensure_schema()
+    verify_schema()
     pool = _open_pool()
     conn = _open_connection(pool)
     try:
@@ -1078,9 +1092,10 @@ def _dependency_report():
 
 def system_checks_tab():
     st.markdown("### 🩺 System Checks")
-    st.caption("Run this on the deployed app to confirm the live environment matches the pinned versions and the migration result.")
+    st.caption("Run this on the deployed app to confirm the live environment matches the pinned versions and the database schema. "
+               "This page only reads; schema changes are made by an administrator with scripts/check_migration.py.")
     try:
-        report = ensure_schema()
+        report = verify_schema()
         with get_db_cursor() as cur:
             cur.execute("SELECT version();")
             server_version = cur.fetchone()[0]
@@ -1092,6 +1107,9 @@ def system_checks_tab():
     st.markdown("#### Dependencies")
     st.write(f"**Python:** {sys.version.split()[0]} · **Database:** {server_version}")
     st.dataframe(deps, width="stretch")
+
+    st.markdown("#### Database schema")
+    st.success("Schema compatible with this app version (read-only check; the app never migrates).")
 
     st.markdown("#### UNIQUE email constraints")
     if report["complete"]:
@@ -1105,10 +1123,8 @@ def system_checks_tab():
         for problem in entry["verification"]["problems"]:
             st.caption(f"Verification: {problem}")
         if entry["duplicates"]:
-            st.warning("Duplicate emails block the constraint. Merge or correct these rows; the constraint is added on the next app restart.")
+            st.warning("Duplicate emails block the constraint. Merge or correct these rows; the constraint is added when an administrator next runs the migration (scripts/check_migration.py).")
             st.dataframe([{"Email": d[0], "Copies": d[1], "Row ids": ", ".join(map(str, d[2]))} for d in entry["duplicates"]], width="stretch")
-        if entry.get("error"):
-            st.error("Creating this UNIQUE index failed. Details are in the server log (Diagnostic code: ICJ-ERR-518).")
 
     st.markdown("#### Historical fallback-location records")
     fallback = report["legacy_fallback_rows"]

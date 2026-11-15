@@ -85,7 +85,7 @@ from diagnostics import (DIAGNOSTIC_CODES, DatabaseConnectionError, RedactingFil
 c.ok("security", DatabaseConnectionError.code == "ICJ-ERR-500" and SchemaMigrationError.code == "ICJ-ERR-511"
      and "duplicate-check query" in DIAGNOSTIC_CODES["ICJ-ERR-504"] and "UNIQUE" in DIAGNOSTIC_CODES["ICJ-ERR-518"]
      and issubclass(DatabaseConnectionError, StartupDiagnosticError) and issubclass(SchemaMigrationError, StartupDiagnosticError),
-     "codes: 500 = connection init, 511 = schema migration, 504 = duplicate-check query, 518 = uniqueness not verified")
+     "codes: 500 = connection init, 511 = schema check failed / not migrated, 504 = duplicate-check query, 518 = uniqueness not verified")
 c.ok("security", all("Traceback" not in e.user_message and "ICJ" not in e.user_message and "try again" in e.user_message.lower()
                      and "contact" in e.user_message.lower() for e in (DatabaseConnectionError, SchemaMigrationError)),
      "startup user messages: plain explanation + next action, no technical detail")

@@ -12,7 +12,7 @@ that no data changes."""
 import os
 import runpy
 
-from _common import Checks, REPO, fresh_db, load_legacy_schema, require_local_postgres, sql
+from _common import Checks, REPO, fresh_db, load_legacy_schema, migrate_as_administrator, require_local_postgres, sql
 
 require_local_postgres()
 import psycopg2  # local-only test adapter
@@ -128,24 +128,23 @@ run("Employer Portal", EMPLOYER, {REGISTER}, secrets={"connection_string": MALFO
 check_scenario("malformed connection string", "ICJ-ERR-500", "startup.database_connection", "invalid dsn: missing",
                secrets_not_in_log=(MALFORMED_PASSWORD, MALFORMED_DSN))
 
-# 4. Migration failure --------------------------------------------------------
-q("ALTER TABLE beta_employers DROP CONSTRAINT beta_employers_pkey;")  # makes the new foreign key impossible
+# 4. Schema not migrated (the app never migrates; startup check is read-only) ---
 fresh_server()
 run("Employer Portal", EMPLOYER, {REGISTER})
-check_scenario("migration failure", "ICJ-ERR-511", "startup.schema_migration", "there is no unique constraint matching given keys")
+check_scenario("schema not migrated", "ICJ-ERR-511", "startup.schema_check", "Missing: column beta_employers.password_hash")
 c.ok("data", not migrated() and count("beta_employers") == 0 and count("system_telemetry_logs") == 0,
-     "migration failure: fully rolled back, no rows written")
+     "schema not migrated: app did not migrate and wrote no rows")
 run("Employer Portal", SIGN_IN, {"Sign In"})
 c.ok("classification", codes_shown() == ["ICJ-ERR-511"] and "while employer_portal.sign_in.lookup" in server_log(),
-     "migration failure during employer sign-in: ICJ-ERR-511, not ICJ-ERR-512", debug)
+     "schema not migrated during employer sign-in: ICJ-ERR-511, not ICJ-ERR-512", debug)
 run("Employee Portal", CANDIDATE, {LOCK})
-c.ok("classification", codes_shown() == ["ICJ-ERR-511"], "migration failure during candidate intake: ICJ-ERR-511, not ICJ-ERR-501", debug)
+c.ok("classification", codes_shown() == ["ICJ-ERR-511"], "schema not migrated during candidate intake: ICJ-ERR-511, not ICJ-ERR-501", debug)
 
-# 5. Recovery: fix the cause, the same server retries (failures are not cached) ---
-q("ALTER TABLE beta_employers ADD PRIMARY KEY (id);")
+# 5. Recovery: the administrator migrates; the same server re-checks (failures are not cached)
+migrate_as_administrator(DB)
 run("Employer Portal", EMPLOYER, {REGISTER})
 c.ok("processing", migrated() and count("beta_employers") == 1 and any("Registration successful" in t for t in shown("success")) and codes_shown() == [],
-     "after fixing the cause, the next request migrates and registration succeeds (failure was not cached)", debug)
+     "after the administrator migration, the next request passes the check and registration succeeds (failure was not cached)", debug)
 
 # 6. Actual duplicate-check query failure ------------------------------------
 q("ALTER TABLE beta_employers RENAME COLUMN admin_email TO admin_email_tmp;")  # breaks only the request's own query

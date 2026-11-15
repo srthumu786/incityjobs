@@ -57,11 +57,14 @@ echo "Throwaway PostgreSQL $("$PG_BIN/postgres" --version | awk '{print $3}') ru
 
 # --- point the local-only psycopg2 test adapter at it
 export PGSHIM_HOST="$WORK" PGSHIM_PORT="$PORT" PGSHIM_USER=postgres PGPASSWORD="$TEST_PGPASSWORD"
+# Server log of the throwaway cluster: test_startup_readonly.py reads it for DDL statements
+# (logged with log_statement = 'ddl' even when their transaction is rolled back).
+export INCITY_TEST_SERVER_LOG="$WORK/server.log"
 export PYTHONPATH="$TESTS/pg_adapter:$TESTS"
 unset INCITY_DB_URL
 
 status=0
-for suite in ${INCITY_SUITES:-test_units.py test_migration.py test_e2e.py test_diagnostics.py test_recommendations.py test_db_roles.py test_migration_partial.py}; do
+for suite in ${INCITY_SUITES:-test_units.py test_migration.py test_e2e.py test_diagnostics.py test_recommendations.py test_db_roles.py test_migration_partial.py test_startup_readonly.py}; do
   echo; echo "=== $suite ==="
   python3 "$TESTS/$suite" 2> "$WORK/$suite.stderr" || { status=1; echo "--- $suite stderr (last 20 lines) ---"; tail -20 "$WORK/$suite.stderr"; }
 done

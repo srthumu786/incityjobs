@@ -3,7 +3,7 @@
     python3 tests/test_ci_summary.py
 
 Feeds the reporter successful, incomplete, truncated and failed `run_local.sh` output and checks
-that only a complete, fully successful run is accepted. Not one of the seven suites run by
+that only a complete, fully successful run is accepted. Not one of the eight suites run by
 run_local.sh (it would change their expected totals); the CI workflow runs it as its own step.
 """
 import os
@@ -72,9 +72,9 @@ E2E = "end-to-end tests: 72/72 passed (security 72/72)"
 # --- successful output
 ok, problems = verdict(good_run())
 c.ok("success", ok and not problems, "a complete run with the expected totals is accepted", debug=lambda: problems)
-c.ok("success", ci_summary.EXPECTED_TOTAL == 398, "expected totals add up to 398")
-c.ok("success", [n for _, _, n in ci_summary.EXPECTED] == [41, 34, 72, 33, 59, 69, 90],
-     "expected per-suite totals are 41, 34, 72, 33, 59, 69, 90 in run order")
+c.ok("success", ci_summary.EXPECTED_TOTAL == 434, "expected totals add up to 434 (398 + 36 startup read-only checks)")
+c.ok("success", [n for _, _, n in ci_summary.EXPECTED] == [41, 34, 72, 33, 59, 69, 90, 36],
+     "expected per-suite totals are 41, 34, 72, 33, 59, 69, 90, 36 in run order")
 ok, problems = verdict(good_run(noise=True) + ["", "  "])
 c.ok("success", ok, "debug lines, stderr tails and trailing blank lines don't affect a good run", debug=lambda: problems)
 ok, problems = verdict(good_run(**{"test_units.py": {"groups": "security 26/26, processing 9/9, data 3/3, matching 3/3"}}))
@@ -175,9 +175,9 @@ with tempfile.TemporaryDirectory() as tmp:
 
     r = run_reporter(good_run(), summary_file)
     summary = open(summary_file, encoding="utf-8").read()
-    c.ok("cli", r.returncode == 0 and "All seven suites passed: 398/398 checks." in summary
-         and summary.count("✅ passed") == 7 and "::error" not in r.stdout,
-         "good run: exit 0, 398/398 in the summary, seven passed rows, no error annotations",
+    c.ok("cli", r.returncode == 0 and "All eight suites passed: 434/434 checks." in summary
+         and summary.count("✅ passed") == 8 and "::error" not in r.stdout,
+         "good run: exit 0, 434/434 in the summary, eight passed rows, no error annotations",
          debug=lambda: (r.returncode, r.stdout, summary))
     r = run_reporter(good_run(**{"test_units.py": {"total": 0}}), summary_file)
     summary = open(summary_file, encoding="utf-8").read()

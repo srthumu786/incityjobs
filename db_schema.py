@@ -1,7 +1,11 @@
 """Database schema and safe migrations for InCityJobs.
 
-Used by app.py (once per server process) and by scripts/check_migration.py.
-No Streamlit imports.
+Two separate entry points (no Streamlit imports):
+- apply_schema(): the MIGRATION. Runs DDL. Used only by the administrator tool
+  scripts/check_migration.py, after explicit authorization. app.py never calls it.
+- check_schema(): the read-only COMPATIBILITY CHECK that app.py runs on startup.
+  Catalog queries only, inside a READ ONLY transaction that is always rolled
+  back, so PostgreSQL itself refuses any DDL or write it might attempt.
 
 Migration safety rules:
 - Only additive changes (CREATE ... IF NOT EXISTS, ADD COLUMN IF NOT EXISTS).
@@ -10,8 +14,8 @@ Migration safety rules:
   (lower(btrim(email))) and skip NULL/blank emails.
 - Before creating a UNIQUE constraint, existing rows are checked for
   duplicates. If any exist, that constraint is skipped and reported, and the app
-  keeps running with application-level duplicate checks. It is created on a
-  later start once the duplicates have been cleaned up by hand.
+  keeps running with application-level duplicate checks. It is created by the
+  next administrator migration once the duplicates have been cleaned up by hand.
 - A UNIQUE constraint only counts as active after the catalog confirms the index
   is unique, valid, ready and live, on the expected expression and predicate.
   report["complete"] is True only when every constraint passes that check.
@@ -362,3 +366,162 @@ def probe_unique_enforcement(conn) -> dict:
 
 def is_unique_violation(exc: BaseException) -> bool:
     return getattr(exc, "pgcode", None) == "23505"
+
+
+# --------------------------------------------------------------------------- read-only compatibility check
+# What THIS version of the app needs. Kept in step with BASE_SCHEMA_SQL by
+# tests/test_startup_readonly.py, which migrates an empty database and compares
+# its catalog with this list in both directions.
+REQUIRED_SCHEMA = {
+    "beta_employers": ("id", "company_name", "corporate_hq", "admin_email", "admin_phone", "signature_hash",
+                       "password_hash", "setup_code_hash", "setup_code_expires_at", "timestamp",
+                       "verified_at", "verified_by"),
+    "candidate_profiles": ("id", "name", "contact_email", "role", "resume", "address", "current_address",
+                           "latitude", "longitude", "status", "application_status", "timestamp",
+                           "employer_matching_consent", "employer_matching_consent_at",
+                           "employer_matching_consent_policy", "contact_disclosure_consent", "resume_version"),
+    "employer_jobs": ("id", "title", "department", "pricing_tier", "address", "latitude", "longitude",
+                      "source_channel", "external_tracking_id", "timestamp", "employer_id", "requirements",
+                      "match_radius_miles"),
+    "semantic_matches": ("id", "candidate_profile_id", "candidate_email", "employer_email", "match_score",
+                         "distance_miles", "status", "payload", "timestamp", "job_id"),
+    "system_telemetry_logs": ("id", "diagnostic_error_code", "error_context_vector", "error_detail", "timestamp"),
+    "employer_recommendations": ("id", "job_id", "employer_id", "candidate_profile_id", "status", "status_reason",
+                                 "employer_ref", "profile", "fingerprint", "notified_fingerprint",
+                                 "viewed_fingerprint", "is_new", "score", "distance_miles", "created_at",
+                                 "updated_at", "available_at", "viewed_at", "withdrawn_at"),
+    "privacy_audit_log": ("id", "event_type", "actor_type", "actor_ref", "candidate_profile_id", "employer_id",
+                          "job_id", "recommendation_id", "detail", "created_at"),
+}
+# Consent must default to NO authorization: type, NOT NULL and default are checked exactly.
+# (column: (udt_name, not_null, default or None))
+REQUIRED_COLUMN_DEFINITIONS = {
+    ("candidate_profiles", "employer_matching_consent"): ("bool", True, "false"),
+    ("candidate_profiles", "contact_disclosure_consent"): ("bool", True, "false"),
+    ("candidate_profiles", "employer_matching_consent_at"): ("timestamptz", False, None),
+    ("candidate_profiles", "employer_matching_consent_policy"): ("varchar", False, None),
+    ("candidate_profiles", "resume_version"): ("int4", True, "1"),
+}
+# Named indexes (the email UNIQUE indexes are checked separately, see UNIQUE_EMAIL_CONSTRAINTS).
+REQUIRED_INDEXES = {  # name: (table, must be unique)
+    "uq_semantic_matches_candidate_job": ("semantic_matches", True),
+    "idx_employer_recommendations_employer_status": ("employer_recommendations", False),
+    "idx_employer_recommendations_candidate": ("employer_recommendations", False),
+    "idx_privacy_audit_log_candidate": ("privacy_audit_log", False),
+    "idx_privacy_audit_log_recommendation": ("privacy_audit_log", False),
+}
+REQUIRED_UNIQUE_CONSTRAINTS = (  # (table, columns)
+    ("employer_recommendations", ("job_id", "candidate_profile_id")),
+    ("employer_recommendations", ("employer_ref",)),
+)
+REQUIRED_CHECK_CONSTRAINTS = (("employer_recommendations", "status"), ("privacy_audit_log", "actor_type"))
+AUDIT_FUNCTION = "incity_reject_audit_change"
+# pg_trigger.tgtype bits: ROW=1, BEFORE=2, DELETE=8, UPDATE=16, TRUNCATE=32
+REQUIRED_TRIGGERS = {  # name: (table, tgtype)
+    "privacy_audit_log_append_only": ("privacy_audit_log", 1 | 2 | 8 | 16),
+    "privacy_audit_log_no_truncate": ("privacy_audit_log", 2 | 32),
+}
+
+
+def _missing_objects(cur) -> list:
+    """Everything REQUIRED_* lists that the database lacks or has in a weaker form.
+    Catalog queries only. Returns plain object names, never row data."""
+    missing = []
+    cur.execute("""SELECT table_name, column_name, udt_name, is_nullable = 'NO', column_default
+                   FROM information_schema.columns WHERE table_schema = current_schema();""")
+    columns = {(t, c): (str(udt), bool(notnull), None if default is None else str(default))
+               for t, c, udt, notnull, default in cur.fetchall()}
+    cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = current_schema();")
+    tables = {r[0] for r in cur.fetchall()}
+    for table, required in REQUIRED_SCHEMA.items():
+        if table not in tables:
+            missing.append(f"table {table}")
+            continue
+        missing += [f"column {table}.{c}" for c in required if (table, c) not in columns]
+    for (table, column), expected in REQUIRED_COLUMN_DEFINITIONS.items():
+        actual = columns.get((table, column))
+        if actual is not None and tuple(actual) != expected:
+            missing.append(f"column {table}.{column} definition (type, NOT NULL, default) is "
+                           f"{actual}, expected {expected}")
+
+    cur.execute("""SELECT c.relname, t.relname, i.indisunique, i.indisvalid AND i.indisready AND i.indislive
+                   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_class t ON t.oid = i.indrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema();""")
+    indexes = {name: (table, unique, usable) for name, table, unique, usable in cur.fetchall()}
+    for name, (table, unique) in REQUIRED_INDEXES.items():
+        actual = indexes.get(name)
+        if actual is None:
+            missing.append(f"index {name}")
+        elif actual[0] != table or (unique and not actual[1]) or not actual[2]:
+            missing.append(f"index {name} (wrong table, not unique, or not valid)")
+
+    cur.execute("""SELECT t.relname, con.contype::text,
+                          (SELECT string_agg(a.attname::text, ',' ORDER BY a.attname) FROM unnest(con.conkey) k
+                           JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k)
+                   FROM pg_constraint con JOIN pg_class t ON t.oid = con.conrelid
+                   JOIN pg_namespace n ON n.oid = t.relnamespace
+                   WHERE n.nspname = current_schema() AND con.contype IN ('u', 'c') AND con.convalidated;""")
+    constraints = [(table, kind, tuple(str(cols or "").split(","))) for table, kind, cols in cur.fetchall()]
+    for table, cols in REQUIRED_UNIQUE_CONSTRAINTS:
+        if (table, "u", tuple(sorted(cols))) not in constraints:
+            missing.append(f"UNIQUE constraint {table} ({', '.join(cols)})")
+    for table, column in REQUIRED_CHECK_CONSTRAINTS:
+        if (table, "c", (column,)) not in constraints:
+            missing.append(f"CHECK constraint {table}.{column}")
+
+    cur.execute("""SELECT p.oid, p.prorettype = 'trigger'::regtype, p.prosrc
+                   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                   WHERE n.nspname = current_schema() AND p.proname = %s;""", (AUDIT_FUNCTION,))
+    function = cur.fetchone()
+    if function is None or not function[1] or "RAISE EXCEPTION" not in function[2].upper():
+        missing.append(f"audit trigger function {AUDIT_FUNCTION} (absent or does not reject changes)")
+    cur.execute("""SELECT tg.tgname, t.relname, tg.tgtype, tg.tgenabled::text, tg.tgfoid
+                   FROM pg_trigger tg JOIN pg_class t ON t.oid = tg.tgrelid
+                   JOIN pg_namespace n ON n.oid = t.relnamespace
+                   WHERE n.nspname = current_schema() AND NOT tg.tgisinternal;""")
+    triggers = {name: (table, tgtype, enabled, foid) for name, table, tgtype, enabled, foid in cur.fetchall()}
+    for name, (table, tgtype) in REQUIRED_TRIGGERS.items():
+        actual = triggers.get(name)
+        if actual is None:
+            missing.append(f"trigger {name}")
+        elif actual[0] != table or actual[1] != tgtype or (function and actual[3] != function[0]):
+            missing.append(f"trigger {name} (wrong table, events or function)")
+        elif actual[2] not in ("O", "A"):  # D = disabled, R = fires only in replica mode
+            missing.append(f"trigger {name} (not enabled)")
+    return missing
+
+
+def check_schema(conn) -> dict:
+    """READ-ONLY check that the database has the schema this app version needs.
+    Never migrates. Runs in a READ ONLY transaction (PostgreSQL refuses DDL and
+    writes there with SQLSTATE 25006) and always rolls back. Returns the same
+    report as apply_schema plus:
+        "missing": [object names]  (empty when the schema is compatible)
+        "read_only": True           (confirmed by the server, not assumed)
+    "complete" keeps its meaning: email uniqueness verified active. A schema can be
+    compatible (nothing missing) while uniqueness is still unverified (duplicates)."""
+    conn.rollback()  # start a fresh transaction so SET TRANSACTION applies to it
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY;")
+            cur.execute("SHOW transaction_read_only;")
+            read_only = cur.fetchone()[0] == "on"
+            if not read_only:
+                raise RuntimeError("schema check could not start a read-only transaction")
+            report = {"read_only": True, "missing": _missing_objects(cur), "constraints": {}}
+            if report["missing"]:  # incompatible: the app refuses to serve; no further queries
+                report.update(complete=False, legacy_fallback_rows={})
+                return report
+            for index_name, table, column in UNIQUE_EMAIL_CONSTRAINTS:
+                check = verify_unique_index(cur, index_name, table, column)
+                report["constraints"][table] = {
+                    "index": index_name, "column": column, "verification": check,
+                    "profile": email_profile(cur, table, column),
+                    "duplicates": find_duplicate_emails(cur, table, column),
+                    "status": "enforced" if check["active"] else "not_enforced",
+                }
+            report["legacy_fallback_rows"] = legacy_fallback_counts(cur)
+        report["complete"] = all(e["status"] == "enforced" for e in report["constraints"].values())
+        return report
+    finally:
+        conn.rollback()

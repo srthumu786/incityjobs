@@ -7,7 +7,7 @@ prints each problem as a GitHub error annotation, and exits 0 only if the output
 successful run. Standard library only.
 
 A run counts as successful only if ALL of these hold:
-  - each of the seven suites appears exactly once, in the order run_local.sh runs them;
+  - each of the eight suites appears exactly once, in the order run_local.sh runs them;
   - each suite prints exactly one summary line, with its own label, inside its own section;
   - that line reports exactly the expected number of checks (EXPECTED below; never zero), all passed;
   - the per-group counts in that line add up to the same total, each group fully passed;
@@ -31,8 +31,9 @@ EXPECTED = [
     ("test_recommendations.py", "recommendation tests", 59),
     ("test_db_roles.py", "db role tests", 69),
     ("test_migration_partial.py", "partial-migration tests", 90),
+    ("test_startup_readonly.py", "startup read-only tests", 36),
 ]
-EXPECTED_TOTAL = sum(n for _, _, n in EXPECTED)  # 398
+EXPECTED_TOTAL = sum(n for _, _, n in EXPECTED)  # 434
 FINAL_OK, FINAL_FAILED = "ALL SUITES PASSED", "SOME SUITES FAILED"
 
 SECTION = re.compile(r"^=== (?P<suite>\S+) ===$")
@@ -183,7 +184,7 @@ def evaluate(lines):
 
 def report(all_ok, rows, problems, passed_checks):
     if all_ok:
-        verdict = f"**All seven suites passed: {passed_checks}/{EXPECTED_TOTAL} checks.**"
+        verdict = f"**All eight suites passed: {passed_checks}/{EXPECTED_TOTAL} checks.**"
     else:
         verdict = f"**Tests FAILED or the output is incomplete.** {len(problems)} problem(s) found."
     out = ["## InCityJobs test results", "", verdict, "",
@@ -208,7 +209,7 @@ def main(argv):
     for problem in problems:
         print(f"::error title=Test results::{escape_annotation(problem)}")
     if all_ok:
-        print(f"All seven suites passed: {passed_checks}/{EXPECTED_TOTAL} checks.")
+        print(f"All eight suites passed: {passed_checks}/{EXPECTED_TOTAL} checks.")
     return 0 if all_ok else 1
 
 

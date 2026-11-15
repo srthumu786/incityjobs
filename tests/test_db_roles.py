@@ -4,10 +4,9 @@ Runs against the throwaway local cluster, set up like Neon: the database and all
 tables belong to a NON-superuser `neondb_owner` with CREATEROLE, and the script is
 run as that role (never as a superuser). Covers: the production guard, plan mode,
 apply + exact privilege matrix, idempotence, behaviour of each role (allowed and
-refused statements), the CURRENT app under icj_app (startup migration needs owner
-rights, so it stops with ICJ-ERR-511 and changes nothing), the app's main
-workflows under icj_app once startup is verify-only (simulated here; that code
-change is NOT part of this branch), and rollback (--remove) leaving data intact."""
+refused statements), the app's read-only startup schema check under icj_app (no
+owner rights needed, no DDL sent, schema unchanged), the app's main workflows
+under icj_app, and rollback (--remove) leaving data intact."""
 import os
 import runpy
 import stat
@@ -77,6 +76,15 @@ def attempt(url, statement):
             conn.rollback()
         finally:
             conn.close()
+
+
+def schema_fingerprint():
+    """Catalog fingerprint from scripts/schema_fingerprint.sql (read-only): tables, columns,
+    indexes, constraints, triggers, functions, owners and grants. No row data."""
+    return subprocess.run(["psql", "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1", "-h", os.environ["PGSHIM_HOST"],
+                           "-p", os.environ.get("PGSHIM_PORT", "5432"), "-U", SUPER, "-d", DB,
+                           "-f", os.path.join(REPO, "scripts", "schema_fingerprint.sql")],
+                          capture_output=True, text=True, check=True).stdout
 
 
 def fingerprint():
@@ -179,7 +187,7 @@ REFUSED = {
     "drop table": "DROP TABLE semantic_matches;",
     "create table": "CREATE TABLE evil (id int);",
     "alter table": "ALTER TABLE candidate_profiles ADD COLUMN evil int;",
-    "add column if not exists (startup migration)": "ALTER TABLE beta_employers ADD COLUMN IF NOT EXISTS password_hash TEXT;",
+    "add column if not exists (as a migration would)": "ALTER TABLE beta_employers ADD COLUMN IF NOT EXISTS password_hash TEXT;",
     "replace audit trigger function": "CREATE OR REPLACE FUNCTION incity_reject_audit_change() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN RETURN NEW; END $f$;",
     "update audit log": "UPDATE privacy_audit_log SET event_type = 'TAMPERED';",
     "delete audit log": "DELETE FROM privacy_audit_log;",
@@ -243,32 +251,20 @@ def debug(): return {"out": ui.out[-8:], "sql": list(psycopg2.connection.log)[-5
 def errors(): return [t for k, t in ui.out if k in ("error", "warning") and ("ICJ-ERR" in t or "denied" in t.lower())]
 
 
-BEFORE = fingerprint()
+SCHEMA_BEFORE = schema_fingerprint()
 RESOURCE_CACHE.clear(); new_session()
-run("Employee Portal", {"Full Name (Absolute Identity Mapping)": "Jane", "Secure Communication Email Node": "jane@x.com",
+run("Employee Portal", {"Full Name (Absolute Identity Mapping)": "Startup Check", "Secure Communication Email Node": "startup@x.com",
                         "Target Role / Job Title": "Dev", "Paste Resume Text / Background Metrics": "Python developer: sql, docker",
                         "Target City": "Priceville", "Target State": "AL", "Target Zip Code": "35603"},
     {"Lock Profile & Validate Location Paths"})
-c.ok("security", any("ICJ-ERR-511" in t for t in errors()) and fingerprint() == BEFORE,
-     "CURRENT app as icj_app: startup migration needs owner rights -> ICJ-ERR-511, nothing written", debug)
+DDL = ("CREATE ", "ALTER ", "DROP ", "TRUNCATE ", "GRANT ", "REVOKE ", "COMMENT ON ", "REINDEX ")
+sent_ddl = [x[:80] for x in psycopg2.connection.log if x.lstrip().upper().startswith(DDL)]
+c.ok("security", not errors() and sent_ddl == [] and SCHEMA_BEFORE == schema_fingerprint()
+     and q("SELECT count(*) FROM candidate_profiles WHERE contact_email = 'startup@x.com';") == "1",
+     "app as icj_app: read-only startup check passes without owner rights; no DDL sent, schema unchanged",
+     lambda: {"errors": errors(), "ddl": sent_ddl, "out": ui.out[-6:]})
 
-# ================================================================== app workflows under icj_app, startup verify-only
-# Simulates the proposed follow-up change (NOT in this branch): at startup the app
-# only VERIFIES the schema; migrations run separately as neondb_owner.
-_real_apply = db_schema.apply_schema
-def verify_only(conn, commit=True):
-    report = {"constraints": {}}
-    with conn.cursor() as cur:
-        for index_name, table, column in db_schema.UNIQUE_EMAIL_CONSTRAINTS:
-            check = db_schema.verify_unique_index(cur, index_name, table, column)
-            report["constraints"][table] = {"index": index_name, "column": column, "verification": check,
-                                            "status": "enforced" if check["active"] else "failed",
-                                            "profile": db_schema.email_profile(cur, table, column), "duplicates": []}
-        report["legacy_fallback_rows"] = db_schema.legacy_fallback_counts(cur)
-    report["complete"] = all(e["status"] == "enforced" for e in report["constraints"].values())
-    conn.rollback()
-    return report
-db_schema.apply_schema = verify_only
+# ================================================================== app workflows under icj_app (real read-only startup)
 RESOURCE_CACHE.clear(); new_session()
 
 REGISTER = {"Legal Business / Company Name": "Apex", "Corporate Headquarters Address (Billing/Primary Operations)": "1 Main St",
@@ -332,7 +328,6 @@ page = " ".join(texts())
 c.ok("processing", "verified active" in page and not errors(), "icj_app: System Checks and audit screens load", debug)
 c.ok("data", q("SELECT count(*) FROM system_telemetry_logs WHERE error_detail ILIKE '%permission denied%';") == "0",
      "no permission-denied failure was logged during the workflows")
-db_schema.apply_schema = _real_apply
 
 # ================================================================== rollback
 BEFORE = fingerprint()

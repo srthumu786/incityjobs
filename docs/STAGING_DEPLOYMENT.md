@@ -109,6 +109,14 @@ Enter a username (e.g. `alice`) and a long password. Copy the printed line, e.g.
 
 ## 5. Deploy the staging app
 
+> **The app never migrates the database.** On every server start it only runs a read-only
+> schema check (`db_schema.check_schema`, inside a READ ONLY transaction). Against a database
+> that is not migrated it serves no database page and shows **ICJ-ERR-511**. So step 3b (the
+> administrator migration) must be complete before this step. Before deploying, record the
+> schema fingerprint of the test branch (read-only; Neon SQL Editor, branch = the TEST branch):
+> run `scripts/schema_fingerprint.sql` and keep its output (one line per kind of object plus
+> a `TOTAL` line). Step 7 compares it again.
+
 1. Go to <https://share.streamlit.io> → **Create app** → **Yup, I have an app**.
 2. **Repository**: `srthumu786/incityjobs` · **Branch**: `fix/db-pooling-tables` · **Main file path**: `app.py`.
 3. **App URL**: e.g. `incityjobs-staging` (anything clearly marked staging).
@@ -133,6 +141,7 @@ App → **Settings** → **Sharing** → **Who can view this app** → **Only sp
 Sign in through **🔐 Manager Access** in the sidebar, open **Manager Console → 🩺 System Checks**:
 
 - [ ] **Dependencies**: all five packages show ✅ (`streamlit 1.66.0`, `pandas 3.0.6`, `psycopg2-binary 2.9.11`, `geopy 2.4.1`, `openpyxl 3.1.5`). Note the Python and PostgreSQL versions shown.
+- [ ] **Database schema**: "Schema compatible with this app version (read-only check; the app never migrates)".
 - [ ] **UNIQUE email constraints**: "Migration complete: database-level email uniqueness verified active".
 - [ ] **Historical fallback-location records**: counts shown (these rows are kept but excluded from matching).
 - [ ] Take a screenshot of this tab for the review record.
@@ -151,6 +160,10 @@ Functional checks (use test emails you control, e.g. `you+staging1@yourdomain.co
 
 Optional: confirm in the Neon SQL Editor (test branch) that `system_telemetry_logs` contains only expected codes.
 
+- [ ] **Schema unchanged by the app**: after the functional checks, run `scripts/schema_fingerprint.sql`
+  again on the test branch. Every line, including `TOTAL`, must equal the output recorded before
+  step 5. Any difference means something changed the schema: stop and report it.
+
 ## 8. Record the result
 
 Add to the pull request: the screenshot from step 7, the `check_migration.py --apply` output from
@@ -167,6 +180,10 @@ step 3b, and any duplicate-email fixes you made (they must be repeated on produc
 1. Neon: create a backup branch of production first (**New branch** → parent = production, **Current data**, auto-deletion off, name `backup-before-db-pooling`). It's your rollback point.
 2. Apply the same duplicate-email fixes you made in step 3 to production.
 3. Add the `[managers]` section to the **production** app's Secrets.
-4. Merge the pull request. Production migrates itself on its first request.
+4. **Migrate production before deploying the new code**: the app no longer migrates itself and
+   refuses (ICJ-ERR-511) to serve a database that is not migrated. `scripts/check_migration.py`
+   deliberately refuses the production endpoint, so the production migration needs its own,
+   separately approved procedure (backup branch from step 1, dry run, apply, read-only
+   re-verification). Only then merge the pull request.
 5. Open **System Checks** on production and confirm the same results as step 7.
 6. Existing employers start **unverified**: verify each one in **Employer Access**. Legacy employers also need a setup code to set a password.

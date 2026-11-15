@@ -18,14 +18,14 @@ members of `neon_superuser` (administrator rights). Roles created with SQL get o
 granted. On Neon a role belongs to the branch it was created on, so creating them on the
 test branch leaves production untouched.
 
-## Known limitation (must be fixed before the app can use `icj_app`)
+## The app can run as `icj_app`
 
-On every start, the app runs its own schema migration (`db_schema.apply_schema`), which needs
-owner rights. Under `icj_app` the current app therefore stops with **ICJ-ERR-511** and changes
-nothing (proven by the test). Switching the app to `icj_app` needs a small, separately approved
-code change: at start-up the app only *verifies* the schema, and migrations run as
-`neondb_owner` through `scripts/check_migration.py --apply`. The test simulates that change
-and shows every main workflow works under `icj_app`.
+The app no longer migrates on start-up: it only runs a read-only schema check
+(`db_schema.check_schema`). Migrations run separately, as `neondb_owner`, through
+`scripts/check_migration.py --apply` after explicit authorization. So the app needs no owner or
+CREATE rights, and every main workflow works under `icj_app` (`tests/test_db_roles.py` and
+`tests/test_startup_readonly.py`). (Before this change the app migrated on every start, needed
+owner rights, and stopped with ICJ-ERR-511 under `icj_app`.)
 
 ## Steps (you run these; about 15 minutes)
 

@@ -6,7 +6,7 @@ password-protected local PostgreSQL started by tests/run_local.sh."""
 import os
 import runpy
 
-from _common import Checks, REPO, fresh_db, load_legacy_schema, require_local_postgres, sql
+from _common import Checks, REPO, fresh_db, load_legacy_schema, migrate_as_administrator, require_local_postgres, sql
 
 require_local_postgres()
 import psycopg2  # local-only test adapter
@@ -21,6 +21,7 @@ load_legacy_schema(DB)
 # An existing (pre-consent) candidate, as on production today
 sql(DB, """INSERT INTO candidate_profiles (name, role, resume, address, latitude, longitude, status)
            VALUES ('Existing Person', 'Dev', 'python sql docker developer', 'Priceville, AL', 34.5251, -86.8947, 'active_matching_pool');""")
+migrate_as_administrator(DB)  # administrator step before the app runs; the app never migrates
 
 MANAGER_PASSWORD = "correct horse battery staple"
 SECRETS = {"connection_string": "postgresql://ignored-by-test-adapter", "managers": {"alice": auth.hash_password(MANAGER_PASSWORD)}}
@@ -71,7 +72,7 @@ new_session()
 run("Employee Portal")
 c.ok("consent", "Employer Matching Consent" in " ".join(texts("markdown")) and recs.CONSENT_POLICY_VERSION in " ".join(texts("caption")),
      "intake form shows the opt-in checkbox with its policy version", debug)
-run("Employee Portal", candidate_form("No Consent", "noconsent@x.com", consent=False), {LOCK})  # first DB use: app migrates
+run("Employee Portal", candidate_form("No Consent", "noconsent@x.com", consent=False), {LOCK})  # first DB use (schema already migrated by the administrator)
 c.ok("consent", q("SELECT employer_matching_consent FROM candidate_profiles WHERE name = 'Existing Person'") == "f",
      "existing candidate has no consent after migration (previous submission is not authorization)")
 c.ok("consent", consent_row("noconsent@x.com") == "false|-|false" and audit(where="event_type LIKE 'CONSENT%'") == 0,

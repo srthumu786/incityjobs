@@ -13,7 +13,7 @@ Use this to verify the branch on the **private staging app** connected to the **
 ## A. Deployment and startup
 | # | Check | Expected |
 |---|---|---|
-| A1 | Streamlit Cloud: app → **Manage app** → logs after the first page load | Dependencies install. No `ICJ-ERR-500` or `ICJ-ERR-511` lines. |
+| A1 | Streamlit Cloud: app → **Manage app** → logs after the first page load | Dependencies install. No `ICJ-ERR-500` or `ICJ-ERR-511` lines. (ICJ-ERR-511 now means the read-only startup check found the schema not migrated: the app never migrates; an administrator must.) |
 | A2 | Manager Console → **🩺 System Checks** → Dependencies | ✅ for `streamlit 1.66.0`, `pandas 3.0.6`, `psycopg2-binary 2.9.11`, `geopy 2.4.1`, `openpyxl 3.1.5`. Note the Python and PostgreSQL versions. |
 | A3 | System Checks → UNIQUE email constraints | "Migration complete: database-level email uniqueness verified active". Both constraints show ✅ **enforced**. |
 | A4 | System Checks → Historical fallback-location records | The counts are shown (rows are kept but excluded). Note them. |
