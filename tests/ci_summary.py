@@ -32,9 +32,9 @@ EXPECTED = [
     ("test_db_roles.py", "db role tests", 69),
     ("test_migration_partial.py", "partial-migration tests", 90),
     ("test_startup_readonly.py", "startup read-only tests", 36),
-    ("test_migration_ledger.py", "migration ledger tests", 64),
+    ("test_migration_ledger.py", "migration ledger tests", 100),
 ]
-EXPECTED_TOTAL = sum(n for _, _, n in EXPECTED)  # 498
+EXPECTED_TOTAL = sum(n for _, _, n in EXPECTED)  # 534
 FINAL_OK, FINAL_FAILED = "ALL SUITES PASSED", "SOME SUITES FAILED"
 
 SECTION = re.compile(r"^=== (?P<suite>\S+) ===$")

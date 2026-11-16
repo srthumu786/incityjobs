@@ -6,6 +6,8 @@ Imported by the test runner before running scripts/check_migration.py in a subpr
   - every API path requested and every database connection attempt is appended to $FAKE_NEON_LOG,
     so tests can prove a refused run never contacted the database;
   - the Authorization header is checked against $NEON_API_KEY and never logged.
+FAKE_CLOCK_OFFSET_MINUTES shifts this process's clock (datetime.now, time.time), simulating an
+administrator computer whose clock differs from the database's.
 The tool itself has no test switch; this module only exists in tests/.
 """
 import io
@@ -95,3 +97,24 @@ if os.environ.get("FAKE_ERROR_WITH_PERSONAL_DATA"):
             "DETAIL:  Key (lower(btrim(admin_email)))=(leak.person@example.com) already exists.\n"
             "CONTEXT: connection password=hunter2-secret-xyz", pgcode="23505")
     db_schema.apply_schema = _apply_then_fail
+
+if os.environ.get("FAKE_CLOCK_OFFSET_MINUTES"):
+    # Simulate an administrator computer whose clock differs from the database server's clock.
+    import datetime as _dt
+    import time as _time
+    _offset = float(os.environ["FAKE_CLOCK_OFFSET_MINUTES"]) * 60
+    _real_dt = _dt.datetime
+
+    class _SkewedDatetime(_real_dt):
+        @classmethod
+        def now(cls, tz=None):
+            return _real_dt.now(tz) + _dt.timedelta(seconds=_offset)
+
+        @classmethod
+        def utcnow(cls):
+            return _real_dt.utcnow() + _dt.timedelta(seconds=_offset)
+
+    _dt.datetime = _SkewedDatetime
+    _real_time = _time.time
+    _time.time = lambda: _real_time() + _offset
+

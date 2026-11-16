@@ -425,10 +425,16 @@ REQUIRED_TRIGGERS = {  # name: (table, tgtype)
 
 def _missing_objects(cur) -> list:
     """Everything REQUIRED_* lists that the database lacks or has in a weaker form.
-    Catalog queries only. Returns plain object names, never row data."""
+    PostgreSQL system catalog (pg_catalog) queries only: unlike information_schema, these show
+    every object whatever the connecting role's privileges, so a role that may not read a
+    column never sees it reported as missing. Returns plain object names, never row data."""
     missing = []
-    cur.execute("""SELECT table_name, column_name, udt_name, is_nullable = 'NO', column_default
-                   FROM information_schema.columns WHERE table_schema = current_schema();""")
+    cur.execute("""SELECT c.relname, a.attname, t.typname, a.attnotnull, pg_get_expr(d.adbin, d.adrelid)
+                   FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_type t ON t.oid = a.atttypid
+                   LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                   WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') AND a.attnum > 0
+                     AND NOT a.attisdropped;""")
     columns = {(t, c): (str(udt), bool(notnull), None if default is None else str(default))
                for t, c, udt, notnull, default in cur.fetchall()}
     cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = current_schema();")

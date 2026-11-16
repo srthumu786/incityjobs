@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -372,6 +373,230 @@ c.ok("app", "db_migrations" not in imports and not names & {"db_migrations", "LE
 c.ok("app", "streamlit" not in open(os.path.join(REPO, "db_migrations.py"), encoding="utf-8").read()
      and "import streamlit" not in open(os.path.join(REPO, "scripts", "migrate.py"), encoding="utf-8").read(),
      "the runner and ledger module have no Streamlit dependency (administrator command line only)")
+
+# ================================================================== 11. ledger times come from the DATABASE clock
+def db_now(db):
+    return sql(db, "SELECT clock_timestamp()::text;")
+
+
+MIG = open(os.path.join(REPO, "scripts", "migrate.py"), encoding="utf-8").read()
+c.ok("clock", not re.search(r"^\s*(import|from)\s+(datetime|time)\b", MIG, re.M) and "clock_timestamp()" in
+     open(os.path.join(REPO, "db_migrations.py"), encoding="utf-8").read(),
+     "scripts/migrate.py imports no local clock (datetime/time); ledger times use the database's clock_timestamp()")
+for minutes in (+2, -2, +600):
+    name = "ledger_clock"
+    legacy_db(name)
+    low = db_now(name)
+    code_, out, log = migrate(name, "--apply", env_extra={"FAKE_CLOCK_OFFSET_MINUTES": str(minutes)})
+    high = db_now(name)
+    ok_window = sql(name, f"SELECT started_at >= '{low}'::timestamptz AND finished_at <= '{high}'::timestamptz "
+                          f"AND finished_at >= started_at AND execution_ms = round(extract(epoch FROM finished_at - started_at) * 1000) "
+                          f"FROM {LEDGER} WHERE version = 1;")
+    c.ok("clock", code_ == 0 and ok_window == "t",
+         f"administrator clock {minutes:+} min from the database: apply succeeds; start/finish lie within the database's "
+         "own time window; duration = finish - start", out)
+name = "ledger_clock_base"
+baseline_db(name)
+low = db_now(name)
+code_, out, log = migrate(name, "--baseline", "--apply", env_extra={"FAKE_CLOCK_OFFSET_MINUTES": "30"})
+high = db_now(name)
+c.ok("clock", code_ == 0 and sql(name, f"SELECT started_at BETWEEN '{low}'::timestamptz AND '{high}'::timestamptz "
+                                       f"AND finished_at = started_at FROM {LEDGER};") == "t",
+     "baseline with the administrator clock 30 min ahead: recorded with the database's time", out)
+name = "ledger_clock_fail"
+legacy_db(name)
+migrate(name, "--apply")
+low = db_now(name)
+code_, out, log = migrate(name, "--apply", migrations=mdir({"0002_broken.sql": "ALTER TABLE no_such_table ADD COLUMN x int;\n"}),
+                          env_extra={"FAKE_CLOCK_OFFSET_MINUTES": "-45"})
+high = db_now(name)
+c.ok("clock", code_ == 1 and sql(name, f"SELECT started_at >= '{low}'::timestamptz AND finished_at <= '{high}'::timestamptz "
+                                       f"AND finished_at >= started_at FROM {LEDGER} WHERE NOT success;") == "t",
+     "failed attempt with the administrator clock 45 min behind: failure row times from the database", out)
+
+# ================================================================== 12. privileges are reported as privileges, not as missing objects
+ROLES = "ledger_roles"
+fresh_db(ROLES)
+if sql(ROLES, "SELECT count(*) FROM pg_roles WHERE rolname IN ('icj_app', 'icj_readonly');") != "0":
+    # roles are cluster-wide: an earlier suite may have left grants in its own throwaway database
+    for other in sql(ROLES, "SELECT string_agg(datname, ' ') FROM pg_database WHERE NOT datistemplate AND datallowconn;").split():
+        sql(other, "DROP OWNED BY icj_app, icj_readonly;")
+sql(ROLES, f"""DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'neondb_owner') THEN
+              CREATE ROLE neondb_owner LOGIN CREATEROLE NOSUPERUSER PASSWORD '{PW}'; END IF; END $$;
+            DROP ROLE IF EXISTS icj_app; DROP ROLE IF EXISTS icj_readonly; ALTER DATABASE {ROLES} OWNER TO neondb_owner;""")
+os.environ["PGSHIM_USER"] = "neondb_owner"
+load_legacy_schema(ROLES)
+migrate_as_administrator(ROLES)
+os.environ["PGSHIM_USER"] = SUPER
+OWNER = tool.good_url().replace(f"//{SUPER}:", "//neondb_owner:")
+CREDS = os.path.join(tempfile.mkdtemp(dir=os.environ["PGSHIM_HOST"]), "roles.txt")
+applied = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "apply_db_roles.py"), "--db-url",
+                          OWNER.replace("verify-full", "require"), "--credentials-file", CREDS, "--production-endpoint", tool.PROD_EP,
+                          "--apply"], capture_output=True, text=True, env=dict(os.environ, PGSHIM_DB=ROLES))
+role_dsn = dict(l.strip().split(" = ", 1) for l in open(CREDS) if " = " in l and not l.startswith("#"))
+def role_url(role):
+    user_pw = role_dsn[role].split("//", 1)[1].split("@", 1)[0]
+    return f"postgresql://{user_pw}@{tool.STAGING_EP}-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=verify-full"
+os.environ["PGSHIM_DB"] = ROLES
+conn = psycopg2.connect(role_url("icj_readonly"))
+cur = conn.cursor()
+missing_ro = db_schema._missing_objects(cur)
+strict_ro = dbm.schema_verification(cur, strict_version1=True)
+conn.rollback(); conn.close()
+c.ok("privilege", applied.returncode == 0 and missing_ro == [] and strict_ro["missing"] == [] and strict_ro["definition_problems"] == [],
+     "regression: icj_readonly (no access to the hash columns) now sees the complete schema: nothing reported missing",
+     {"missing": missing_ro, "strict": strict_ro["definition_problems"], "roles": applied.stdout[-200:]})
+conn = psycopg2.connect(role_url("icj_readonly"))
+app_check = db_schema.check_schema(conn)
+conn.close()
+c.ok("privilege", app_check["missing"] == [], "regression: the app's read-only startup check is also privilege-independent", app_check["missing"])
+before = schema_fp(ROLES)
+code_, out, log = migrate(ROLES, "--baseline", "--apply", url=role_url("icj_readonly"))
+c.ok("privilege", code_ == 6 and "INSUFFICIENT PRIVILEGE (this is not a schema problem)" in out and "no CREATE privilege" in out
+     and "missing" not in out.split("INSUFFICIENT")[0].lower().replace("missing:", "") and schema_fp(ROLES) == before and ledger(ROLES) is None,
+     "icj_readonly --baseline --apply: exit 6, reported as insufficient privilege (no CREATE), not as missing objects", out)
+code_, out, log = migrate(ROLES, "--apply", url=role_url("icj_app"))
+c.ok("privilege", code_ == 6 and "does not own" in out and "no CREATE privilege" in out and schema_fp(ROLES) == before,
+     "icj_app --apply: exit 6, names the missing CREATE privilege and table ownership", out)
+code_, out, log = migrate(ROLES, "--baseline", "--apply", url=OWNER)
+c.ok("privilege", code_ == 0 and ledger(ROLES) == "1:baselined:true", "the owner baselines the same database", out)
+before = schema_fp(ROLES)
+for role in ("icj_app", "icj_readonly"):
+    code_, out, log = migrate(ROLES, "--status", url=role_url(role))
+    c.ok("privilege", code_ == 6 and f"role '{role}' cannot read the ledger" in out and "INTEGRITY" not in out,
+         f"{role} --status on a ledgered database: exit 6 'cannot read the ledger', not an integrity problem", out)
+code_, out, log = migrate(ROLES, "--apply", url=role_url("icj_app"), migrations=mdir({"0002_x.sql": "CREATE TABLE ledger_role_x (id int);\n"}))
+c.ok("privilege", code_ == 6 and "cannot read the ledger" in out and "cannot write the ledger" in out and schema_fp(ROLES) == before,
+     "icj_app --apply with a pending migration on a ledgered database: exit 6, nothing run", out)
+code_, out, log = migrate(ROLES, "--apply", url=OWNER, migrations=mdir({"0002_needs_superuser.sql": "ALTER ROLE postgres NOSUPERUSER;\n"}))
+c.ok("privilege", code_ == 6 and "INSUFFICIENT PRIVILEGE" in out and "42501" in out and ledger(ROLES, "success") == "1:baselined:true"
+     and ledger(ROLES, "NOT success") == "2:applied:false",
+     "a migration that needs more than the owner's rights: exit 6, rolled back, the attempt recorded (success = false)", out)
+
+# ================================================================== 13. strict version-1 definitions (baseline)
+FRESH = "ledger_v1_fresh"
+fresh_db(FRESH)
+migrate_as_administrator(FRESH)
+for label, name in (("an empty database migrated", FRESH), ("a migrated legacy copy", "ledger_base")):
+    os.environ["PGSHIM_DB"] = name
+    conn = psycopg2.connect(tool.good_url()); cur = conn.cursor()
+    problems_, extras_ = dbm.version1_definition_problems(cur)
+    conn.rollback(); conn.close()
+    c.ok("v1-spec", problems_ == [] and (extras_ == [] or name == "ledger_base"),
+         f"VERSION1_* matches {label} exactly", {"problems": problems_, "extras": extras_})
+cols = sql(FRESH, """SELECT count(*) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = 'public' AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped;""")
+cons = sql(FRESH, "SELECT count(*) FROM pg_constraint con JOIN pg_namespace n ON n.oid = con.connamespace WHERE n.nspname = 'public';")
+c.ok("v1-spec", int(cols) == sum(len(v) for v in dbm.VERSION1_COLUMNS.values()) == 86 and int(cons) == len(dbm.VERSION1_CONSTRAINTS) == 16
+     and len(dbm.VERSION1_INDEXES) == 7 and len(dbm.VERSION1_TRIGGERS) == 2,
+     "the spec covers every column (86) and constraint (16) the migration creates, plus 7 indexes and 2 triggers")
+c.ok("v1-spec", not any(t == "semantic_matches" and k == "foreign key" and "candidate_profile_id" in d for t, k, d in dbm.VERSION1_CONSTRAINTS)
+     and not any(t == "beta_employers" and v[1] for t, cols_ in dbm.VERSION1_COLUMNS.items() for n, v in cols_.items()
+                 if t == "beta_employers" and n == "admin_email"),
+     "the spec adds no constraint version 1 lacks (e.g. no FK on semantic_matches.candidate_profile_id, admin_email stays nullable)")
+DEVIATIONS = [
+    ("foreign key dropped", "ALTER TABLE employer_jobs DROP CONSTRAINT employer_jobs_employer_id_fkey;",
+     "missing or different foreign key on employer_jobs"),
+    ("foreign key ON DELETE rule changed", "ALTER TABLE semantic_matches DROP CONSTRAINT semantic_matches_job_id_fkey; "
+     "ALTER TABLE semantic_matches ADD CONSTRAINT semantic_matches_job_id_fkey FOREIGN KEY (job_id) REFERENCES employer_jobs(id) ON DELETE CASCADE;",
+     "missing or different foreign key on semantic_matches"),
+    ("foreign key NOT VALID", "ALTER TABLE employer_recommendations DROP CONSTRAINT employer_recommendations_job_id_fkey; "
+     "ALTER TABLE employer_recommendations ADD CONSTRAINT employer_recommendations_job_id_fkey FOREIGN KEY (job_id) "
+     "REFERENCES employer_jobs(id) ON DELETE CASCADE NOT VALID;", "is NOT VALID"),
+    ("primary key dropped", "ALTER TABLE system_telemetry_logs DROP CONSTRAINT system_telemetry_logs_pkey;",
+     "missing or different primary key on system_telemetry_logs"),
+    ("column type changed", "ALTER TABLE employer_jobs ALTER COLUMN match_radius_miles TYPE bigint;",
+     "column employer_jobs.match_radius_miles: type is 'bigint'"),
+    ("NOT NULL removed", "ALTER TABLE candidate_profiles ALTER COLUMN application_status DROP NOT NULL;",
+     "column candidate_profiles.application_status: NOT NULL is False"),
+    ("default changed", "ALTER TABLE employer_jobs ALTER COLUMN match_radius_miles SET DEFAULT 50;",
+     "column employer_jobs.match_radius_miles: default is '50'"),
+    ("CHECK definition widened", "ALTER TABLE employer_recommendations DROP CONSTRAINT employer_recommendations_status_check; "
+     "ALTER TABLE employer_recommendations ADD CONSTRAINT employer_recommendations_status_check "
+     "CHECK (status IN ('QUEUED', 'AVAILABLE', 'VIEWED', 'WITHDRAWN', 'DELIVERED'));",
+     "missing or different CHECK constraint on employer_recommendations"),
+    ("index definition changed", "DROP INDEX idx_employer_recommendations_candidate; "
+     "CREATE INDEX idx_employer_recommendations_candidate ON employer_recommendations (job_id);",
+     "index idx_employer_recommendations_candidate is"),
+    ("trigger given a WHEN (false) condition (same events, never fires)", "DROP TRIGGER privacy_audit_log_append_only ON privacy_audit_log; "
+     "CREATE TRIGGER privacy_audit_log_append_only BEFORE UPDATE OR DELETE ON privacy_audit_log FOR EACH ROW WHEN (false) "
+     "EXECUTE FUNCTION incity_reject_audit_change();", "trigger privacy_audit_log_append_only is"),
+    ("audit function body changed (still raises)", "CREATE OR REPLACE FUNCTION incity_reject_audit_change() RETURNS trigger LANGUAGE plpgsql "
+     "AS $$ BEGIN RAISE EXCEPTION 'nope'; END; $$;", "function incity_reject_audit_change differs from version 1"),
+]
+for label, change, expected in DEVIATIONS:
+    name = "ledger_v1_dev"
+    baseline_db(name, extra_sql=change)
+    before = schema_fp(name)
+    code_, out, log = migrate(name, "--baseline", "--apply")
+    c.ok("v1-spec", code_ == 1 and expected in out and "does not match version 1" in out and ledger(name) is None and schema_fp(name) == before,
+         f"baseline refused, nothing recorded or created: {label}", out)
+name = "ledger_v1_extra"
+baseline_db(name, extra_sql="ALTER TABLE candidate_profiles ADD COLUMN email VARCHAR(255); CREATE INDEX legacy_extra_idx ON employer_jobs (title);")
+code_, out, log = migrate(name, "--baseline", "--apply")
+c.ok("v1-spec", code_ == 0 and "note (allowed): extra column candidate_profiles.email" in out and "extra index legacy_extra_idx" in out
+     and "candidate_profiles.email" in sql(name, f"SELECT detail->>'allowed_extras' FROM {LEDGER};"),
+     "extra legacy objects (e.g. the old optional email column) are allowed, reported and noted in the ledger", out)
+name = "ledger_v1_later"
+legacy_db(name)
+migrate(name, "--apply")
+code_, out, log = migrate(name, "--apply", migrations=mdir({"0002_change_default.sql":
+                                                            "ALTER TABLE employer_jobs ALTER COLUMN match_radius_miles SET DEFAULT 30;\n"}))
+c.ok("v1-spec", code_ == 0 and ledger(name) == "1:applied:true,2:applied:true" and "strict version-1" not in out,
+     "once a later version is applied, the exact version-1 definitions no longer apply (a v2 may change them)", out)
+
+# ================================================================== 14. the two migration tools cannot change the schema at the same time
+FENCE = "ledger_fence"
+legacy_db(FENCE)
+migrate(FENCE, "--apply")
+os.environ["PGSHIM_DB"] = FENCE
+before = (schema_fp(FENCE), ledger(FENCE))                        # read before the lock below is taken
+old_tool = psycopg2.connect(tool.good_url())                      # what check_migration.py --apply does first
+with old_tool.cursor() as cur:
+    cur.execute("ALTER TABLE beta_employers ADD COLUMN IF NOT EXISTS password_hash TEXT;")
+t0 = time.monotonic()
+code_, out, log = migrate(FENCE, "--apply", migrations=mdir({"0002_fenced.sql": "CREATE TABLE ledger_fenced (id int);\n"}))
+waited = time.monotonic() - t0
+old_tool.rollback(); old_tool.close()
+c.ok("fence", code_ == 4 and "another session is changing the schema of beta_employers" in out and (schema_fp(FENCE), ledger(FENCE)) == before
+     and waited < 30, "old tool mid-migration (holding its lock on beta_employers): migrate.py exits 4 after a short wait, nothing done", out)
+SLOW_FENCE = mdir({"0002_slow.sql": "CREATE TABLE ledger_fence_slow (id int);\nSELECT pg_sleep(4);\n"})
+FENCE_HELD = ("SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation WHERE c.relname = 'beta_employers' "
+              "AND l.mode = 'ShareUpdateExclusiveLock' AND l.granted;")
+def wait_for_fence():
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if sql(FENCE, FENCE_HELD) != "0":
+            return True
+        time.sleep(0.1)
+    return False
+def new_tool_run():
+    result = migrate(FENCE, "--apply", migrations=SLOW_FENCE)
+    return result[0], time.monotonic(), result[1]
+with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+    new_f = pool.submit(new_tool_run)
+    fence_seen = wait_for_fence()                                 # migrate.py is inside its transaction now
+    conn_ = psycopg2.connect(tool.good_url())
+    t = time.monotonic()
+    with conn_.cursor() as cur_:                                  # an ordinary app write while the fence is held
+        cur_.execute("INSERT INTO candidate_profiles (name, contact_email) VALUES ('Fence Test', 'fence@x.com');")
+    conn_.commit(); conn_.close()
+    app_seconds = time.monotonic() - t
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool2:
+        old_f = pool2.submit(tool.run, FENCE, "--apply")           # the real scripts/check_migration.py --apply
+        waited = False
+        while not old_f.done() and not waited:                     # is its DDL waiting for migrate.py's fence?
+            waited = sql(FENCE, "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                                "AND wait_event_type = 'Lock' AND query LIKE '%ALTER TABLE beta_employers%';") != "0"
+            time.sleep(0.05)
+        old_code, old_out, _ = old_f.result()
+    new_code, new_end, new_out = new_f.result()
+c.ok("fence", fence_seen and waited and new_code == 0 and old_code == 0,
+     "check_migration.py started while migrate.py held the fence: its DDL was seen waiting on the lock, then both "
+     "completed (serialized, never concurrent)", {"fence_seen": fence_seen, "waited": waited, "new": new_out[-300:], "old": old_out[-300:]})
+c.ok("fence", fence_seen and app_seconds < 2, f"the fence does not block the app: an INSERT while it was held took {app_seconds:.2f} s")
+code_, out, log = migrate(FENCE, "--status", migrations=SLOW_FENCE)
+c.ok("fence", code_ == 0 and "up to date" in out, "after both runs: ledger and schema consistent (status up to date)", out)
 
 for d in [p for p in os.listdir(os.environ["PGSHIM_HOST"]) if p.startswith("migrations-")]:
     shutil.rmtree(os.path.join(os.environ["PGSHIM_HOST"], d), ignore_errors=True)

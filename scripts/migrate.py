@@ -20,17 +20,30 @@ pinned baseline checksum, transaction-safe files) and the target is verified (Ne
 sslmode=verify-full with --ca-file, endpoint ids, Neon's API confirming the branch). Then, in ONE
 transaction (lock_timeout 10 s, statement_timeout 120 s):
   1. a transaction-scoped advisory lock: if another runner holds it, exit 4 at once;
-  2. the ledger is checked (structure, one success per version, append-only triggers) and
+  2. the connecting role's privileges are checked (ledger access; for --apply also CREATE on the
+     schema and ownership of the app tables; for --baseline CREATE): if lacking, exit 6
+     (INSUFFICIENT PRIVILEGE), reported separately from missing schema objects;
+  3. a fence lock (SHARE UPDATE EXCLUSIVE on beta_employers, 3 s wait): it does not block the
+     app's reads and writes, but it conflicts with any DDL on that table, so the older
+     scripts/check_migration.py (whose migration always alters beta_employers) cannot change the
+     schema at the same time; if the fence can't be taken, exit 4;
+  4. the ledger is checked (structure, one success per version, append-only triggers) and
      compared with the code: MODIFIED, MISSING, OUT OF ORDER or DUPLICATE -> exit 5, nothing run;
-  3. --apply / dry run: every pending migration runs in version order, then the actual schema is
+  5. --apply / dry run: every pending migration runs in version order, then the actual schema is
      verified (everything the app needs, UNIQUE email constraints active) and, with --apply, a
      duplicate-insert probe proves enforcement; one ledger row per migration is written; only if
      everything passed does --apply commit, otherwise all of it is rolled back;
      --baseline: nothing is run; the actual schema is verified first and only if it is complete
-     is version 1 recorded (method 'baselined'). A database with no ledger whose schema is already
+     is version 1 recorded (method 'baselined'). The baseline check is STRICT: every version-1
+     column type, NOT NULL rule and default, primary and foreign key (with its ON DELETE rule),
+     UNIQUE and CHECK definition, index and trigger definition and the audit function body
+     must match db_migrations.VERSION1_* exactly (extra legacy objects are reported, not refused). A database with no ledger whose schema is already
      complete must be baselined: --apply refuses to re-run the baseline on it.
-After a failed --apply, one ledger row with success = false records the attempt (error type and
-SQLSTATE only). After a commit, a read-only re-verification runs.
+After a migration fails during --apply, a second transaction records one ledger row with
+success = false (error type and SQLSTATE only), creating the ledger if it had been rolled back
+with the failed transaction. Failures before any migration ran (privileges, locks, integrity)
+are reported but not recorded. After a commit, a read-only re-verification runs.
+All ledger times come from the DATABASE clock (clock_timestamp()), never this computer's clock.
 
 Exit codes:
     0  done (or dry run: would succeed; status: up to date)
@@ -40,14 +53,13 @@ Exit codes:
        restore from the backup branch or report the output)
     4  another migration runner holds the lock: nothing done
     5  ledger or code integrity problem (modified, missing, out-of-order, duplicate): nothing run
+    6  insufficient privilege for the connecting role: nothing done
 """
 import argparse
-import datetime
 import json
 import os
 import subprocess
 import sys
-import time
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(SCRIPTS)
@@ -56,6 +68,14 @@ import psycopg2  # noqa: E402
 import check_migration as guard  # noqa: E402  (target verification, TLS, redacted output, probe)
 import db_migrations as dbm  # noqa: E402
 import db_schema  # noqa: E402
+
+FENCE_TABLE = "beta_employers"   # check_migration.py's migration always runs ALTER TABLE on it first
+
+
+class Refusal(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code, self.message = code, message
 
 
 def git_commit():
@@ -67,10 +87,6 @@ def git_commit():
         return (sha if len(sha) == 40 else None), dirty
     except (OSError, subprocess.SubprocessError):
         return None, False
-
-
-def now():
-    return datetime.datetime.now(datetime.timezone.utc)
 
 
 def start(cur, read_only=False):
@@ -86,20 +102,60 @@ def error_type(exc):
 
 
 def read_state(cur, code):
-    """(ledger exists, ledger problems, successful rows, pending, integrity problems)."""
+    """(ledger exists, successful rows, pending, integrity problems)."""
     if not dbm.ledger_exists(cur):
-        return False, [], [], list(code), []
+        return False, [], list(code), []
     structure = dbm.ledger_problems(cur)
     rows = dbm.ledger_rows(cur) if not any("lacks column" in p for p in structure) else []
     pending, integrity = dbm.validate_ledger(code, rows)
-    return True, structure, rows, pending, structure + integrity
+    return True, rows, pending, structure + integrity
 
 
 def say_verification(say, v):
-    say(f"Schema verification: {'complete' if v['ok'] else 'NOT complete'} "
-        f"(checked {json.dumps(v['checked'])}; UNIQUE email constraints active: {v['unique_email_active']})")
+    say(f"Schema verification{' (strict version-1 definitions)' if v['strict_version1'] else ''}: "
+        f"{'complete' if v['ok'] else 'NOT complete'} (checked {json.dumps(v['checked'])}; "
+        f"UNIQUE email constraints active: {v['unique_email_active']})")
     for item in v["missing"]:
         say(f"   missing: {item}")
+    for item in v["definition_problems"]:
+        say(f"   version-1 definition: {item}")
+    for item in v["extras"]:
+        say(f"   note (allowed): {item}")
+
+
+def preflight(cur, args, say, mode):
+    """Database, advisory lock, privileges and (for changes) the cross-tool fence."""
+    cur.execute("SELECT current_database();")
+    database = cur.fetchone()[0]
+    if database != args.expect_database:
+        raise Refusal(2, f"Refused: connected to database {database!r}, expected {args.expect_database!r}. Nothing was changed.")
+    if mode != "status" and not dbm.try_lock(cur):
+        raise Refusal(4, "REFUSED: another migration runner holds the migration lock. Nothing was done. "
+                         "Wait for it to finish, then run --status.")
+    problems = dbm.privilege_problems(cur, mode, dbm.ledger_exists(cur))
+    if problems:
+        raise Refusal(6, "INSUFFICIENT PRIVILEGE (this is not a schema problem): " + "; ".join(problems)
+                      + ". Nothing was done. Run as the database owner (administrator) role.")
+    if mode != "status":
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL;", (FENCE_TABLE,))
+        if cur.fetchone()[0]:
+            cur.execute("SAVEPOINT icj_fence;")
+            try:
+                cur.execute("SET LOCAL lock_timeout = '3s';")
+                cur.execute(f"LOCK TABLE {FENCE_TABLE} IN SHARE UPDATE EXCLUSIVE MODE;")
+                cur.execute("SET LOCAL lock_timeout = '10s';")
+                cur.execute("RELEASE SAVEPOINT icj_fence;")
+            except psycopg2.Error as exc:
+                if getattr(exc, "pgcode", None) != "55P03":
+                    raise
+                raise Refusal(4, f"REFUSED: another session is changing the schema of {FENCE_TABLE} (for example "
+                                 "scripts/check_migration.py --apply). Nothing was done. Wait for it to finish, then run --status.")
+
+
+def strict_for(code, rows_after):
+    """Exact version-1 definitions apply while the newest applied version is 1."""
+    versions = [r[0] for r in rows_after] or [1]
+    return max(versions) == 1
 
 
 def main() -> int:
@@ -152,20 +208,33 @@ def main() -> int:
         return 1
     try:
         return run(conn, args, code, say, sha, dirty)
+    except Refusal as refusal:
+        conn.rollback()
+        say(refusal.message)
+        return refusal.code
     finally:
         conn.close()   # an uncommitted transaction is rolled back by PostgreSQL when the connection closes
+
+
+def privilege_exit(conn, exc, say):
+    conn.rollback()
+    say(f"INSUFFICIENT PRIVILEGE (this is not a schema problem): {guard.describe_error(exc)}. Nothing was committed.")
+    return 6
 
 
 def run(conn, args, code, say, sha, dirty):
     # ---------------------------------------------------------------- status (read-only)
     if args.status:
-        with conn.cursor() as cur:
-            start(cur, read_only=True)
-            if not check_database(cur, args, say):
-                conn.rollback()
-                return 2
-            exists, structure, rows, pending, problems = read_state(cur, code)
-            verification = dbm.schema_verification(cur)
+        try:
+            with conn.cursor() as cur:
+                start(cur, read_only=True)
+                preflight(cur, args, say, "status")
+                exists, rows, pending, problems = read_state(cur, code)
+                verification = dbm.schema_verification(cur, strict_version1=strict_for(code, rows))
+        except psycopg2.Error as exc:
+            if getattr(exc, "pgcode", None) == "42501":
+                return privilege_exit(conn, exc, say)
+            raise
         conn.rollback()
         say(f"Ledger: {'present' if exists else 'none'}; applied: {[r[0] for r in rows] or 'none'}; "
             f"pending: {[m.version for m in pending] or 'none'}")
@@ -187,20 +256,12 @@ def run(conn, args, code, say, sha, dirty):
 
     # ---------------------------------------------------------------- one transaction
     applying = args.apply
-    started_at = now()
-    failed = None   # (migration, error type) when a migration raised
+    failed = None   # (migration, error type, exception, database start time) when a migration raised
     try:
         with conn.cursor() as cur:
             start(cur)
-            if not check_database(cur, args, say):
-                conn.rollback()
-                return 2
-            if not dbm.try_lock(cur):
-                conn.rollback()
-                say("REFUSED: another migration runner holds the migration lock. Nothing was done. "
-                    "Wait for it to finish, then run --status.")
-                return 4
-            exists, structure, rows, pending, problems = read_state(cur, code)
+            preflight(cur, args, say, "baseline" if args.baseline else "apply")
+            exists, rows, pending, problems = read_state(cur, code)
             if problems:
                 conn.rollback()
                 for p in problems:
@@ -212,7 +273,7 @@ def run(conn, args, code, say, sha, dirty):
                 return baseline(conn, cur, args, code, rows, exists, say, sha, dirty)
 
             if not rows:
-                verification = dbm.schema_verification(cur)
+                verification = dbm.schema_verification(cur, strict_version1=True)
                 if verification["ok"]:
                     conn.rollback()
                     say_verification(say, verification)
@@ -226,9 +287,9 @@ def run(conn, args, code, say, sha, dirty):
             if not exists:
                 cur.execute(dbm.LEDGER_SQL)
             say(f"Pending: {', '.join(f'{m.version} {m.name}' for m in pending)}")
-            timings, report = {}, None
+            times, report = {}, None
             for migration in pending:
-                t0 = time.monotonic()
+                started = dbm.db_clock(cur)
                 try:
                     cur.execute(f"SAVEPOINT icj_migration_{migration.version};")
                     if migration.is_baseline:
@@ -239,15 +300,15 @@ def run(conn, args, code, say, sha, dirty):
                         cur.execute(migration.sql)
                     cur.execute(f"RELEASE SAVEPOINT icj_migration_{migration.version};")
                 except Exception as exc:
-                    failed = (migration, error_type(exc), exc)
+                    failed = (migration, error_type(exc), exc, started)
                     raise
-                timings[migration.version] = int((time.monotonic() - t0) * 1000)
-            verification = dbm.schema_verification(cur)
+                times[migration.version] = (started, dbm.db_clock(cur))
+            verification = dbm.schema_verification(cur, strict_version1=strict_for(code, rows + [(m.version,) for m in pending]))
             probe = guard.probe_in_transaction(conn) if applying else None
             proven = verification["ok"] and (not applying or (probe and all(v == "enforced" for v in probe.values())))
             for migration in pending:
-                dbm.record(cur, migration, "applied", True, started_at, timings[migration.version], sha,
-                           json.dumps({"verification": {k: verification[k] for k in ("ok", "checked")},
+                dbm.record(cur, migration, "applied", True, *times[migration.version], sha,
+                           json.dumps({"verification": {k: verification[k] for k in ("ok", "checked", "strict_version1")},
                                        "probe": probe, "uncommitted_changes_in_checkout": dirty,
                                        "batch": [m.version for m in pending]}))
             if report is not None:
@@ -265,16 +326,23 @@ def run(conn, args, code, say, sha, dirty):
                 say("\nNOT APPLIED: verification or probe failed; the transaction was rolled back, nothing changed.")
                 return 1
             conn.commit()
+    except Refusal:
+        raise
     except Exception as exc:
+        if getattr(failed[2] if failed else exc, "pgcode", None) == "42501":
+            code_ = privilege_exit(conn, failed[2] if failed else exc, say)
+            if applying and failed:
+                record_failure(conn, failed, sha, say)
+            return code_
         conn.rollback()
         if failed:
-            migration, kind, original = failed
+            migration, kind, original, _ = failed
             say(f"ERROR in migration {migration.version} {migration.name}: {guard.describe_error(original)}")
         else:
             say(f"ERROR before commit: {guard.describe_error(exc)}")
         say("\nNOT APPLIED: nothing was committed; the transaction was rolled back.")
         if applying and failed:
-            record_failure(conn, failed, started_at, sha, say)
+            record_failure(conn, failed, sha, say)
         return 1
 
     problems = post_commit(conn, code)
@@ -287,33 +355,27 @@ def run(conn, args, code, say, sha, dirty):
     return 0
 
 
-def check_database(cur, args, say):
-    cur.execute("SELECT current_database();")
-    database = cur.fetchone()[0]
-    if database != args.expect_database:
-        say(f"Refused: connected to database {database!r}, expected {args.expect_database!r}. Nothing was changed.")
-        return False
-    return True
-
-
 def baseline(conn, cur, args, code, rows, exists, say, sha, dirty):
     if rows:
         conn.rollback()
         say(f"REFUSED: the ledger already records version(s) {[r[0] for r in rows]}; a baseline is only for a database "
             "with no ledger entries. Use --apply for pending migrations. Nothing was changed.")
         return 5
-    verification = dbm.schema_verification(cur)      # actual structure, BEFORE anything is recorded
+    verification = dbm.schema_verification(cur, strict_version1=True)   # actual structure, BEFORE anything is recorded
     say_verification(say, verification)
     if not verification["ok"]:
         conn.rollback()
-        say("\nREFUSED: the schema is not complete, so it cannot be recorded as migrated. Nothing was recorded "
-            "or created. Run the migrations instead (dry run first).")
+        say("\nREFUSED: the schema does not match version 1, so it cannot be recorded as migrated. Nothing was "
+            "recorded or created. Correct the differences above (a separate, approved change), or run the migrations "
+            "if objects are missing (dry run first).")
         return 1
     if not exists:
         cur.execute(dbm.LEDGER_SQL)
-    dbm.record(cur, code[0], "baselined", True, now(), 0, sha,
-               json.dumps({"verification": {k: verification[k] for k in ("ok", "checked")},
+    moment = dbm.db_clock(cur)
+    dbm.record(cur, code[0], "baselined", True, moment, moment, sha,
+               json.dumps({"verification": {k: verification[k] for k in ("ok", "checked", "strict_version1")},
                            "unique_email_active": verification["unique_email_active"],
+                           "allowed_extras": verification["extras"],
                            "uncommitted_changes_in_checkout": dirty,
                            "note": "existing schema verified and recorded; no migration SQL was run"}))
     later = [m.version for m in code[1:]]
@@ -330,9 +392,10 @@ def baseline(conn, cur, args, code, rows, exists, say, sha, dirty):
     return 0
 
 
-def record_failure(conn, failed, started_at, sha, say):
-    """After the rollback: one success = false row for the failed attempt (own transaction)."""
-    migration, kind, _ = failed
+def record_failure(conn, failed, sha, say):
+    """After the rollback: one success = false row for the failed attempt, in its own transaction
+    (re-creating the ledger if its creation was rolled back with the failed migration)."""
+    migration, kind, _, started = failed
     try:
         with conn.cursor() as cur:
             start(cur)
@@ -341,7 +404,7 @@ def record_failure(conn, failed, started_at, sha, say):
                 say("Failure not recorded: another runner took the lock.")
                 return
             cur.execute(dbm.LEDGER_SQL)
-            dbm.record(cur, migration, "applied", False, started_at, None, sha,
+            dbm.record(cur, migration, "applied", False, started, dbm.db_clock(cur), sha,
                        json.dumps({"error": kind, "rolled_back": True}))
         conn.commit()
         say(f"Recorded the failed attempt in {dbm.LEDGER_TABLE} (success = false; {kind}).")
@@ -355,8 +418,8 @@ def post_commit(conn, code):
     try:
         with conn.cursor() as cur:
             start(cur, read_only=True)
-            exists, structure, rows, pending, problems = read_state(cur, code)
-            verification = dbm.schema_verification(cur)
+            exists, rows, pending, problems = read_state(cur, code)
+            verification = dbm.schema_verification(cur, strict_version1=strict_for(code, rows))
         conn.rollback()
     except psycopg2.Error as exc:
         conn.rollback()
@@ -367,6 +430,7 @@ def post_commit(conn, code):
     if pending:
         out.append(f"still pending: {[m.version for m in pending]}")
     out += [f"missing: {m}" for m in verification["missing"]]
+    out += [f"version-1 definition: {m}" for m in verification["definition_problems"]]
     out += [f"{name} not active" for name, ok in verification["unique_email_active"].items() if not ok]
     return out
 
