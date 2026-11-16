@@ -59,6 +59,8 @@ Exit codes:
        revert the change, or re-run with --accept-drift (ledgered; recorded with the next
        migration) or --repair-version1-drift (no ledger; lets version 1 overwrite what it defines,
        recorded) after the deviation has been reviewed and approved.
+       Both options require SEPARATE ADMINISTRATIVE APPROVAL for each use, and must NOT be used
+       on Neon staging or production without explicit written authorization for that database.
 
 Drift detection: after every successful migration or baseline the ledger row records a catalog
 snapshot of the schema (db_migrations.catalog_snapshot: tables, columns, constraints, indexes,
@@ -184,10 +186,12 @@ def main() -> int:
     parser.add_argument("--migrations-dir", default=dbm.MIGRATIONS_DIR, help="default: the repository's migrations/")
     parser.add_argument("--accept-drift", action="store_true",
                         help="ledgered database whose schema differs from the last recorded snapshot: run the pending "
-                             "migrations anyway and record the accepted differences (only after review and approval)")
+                             "migrations anyway and record the accepted differences. Requires separate administrative approval "
+                             "for each use; never on Neon staging or production without explicit authorization")
     parser.add_argument("--repair-version1-drift", action="store_true",
                         help="database WITHOUT a ledger whose existing objects differ from version 1: let the version-1 "
-                             "migration overwrite what it defines and record the deviations (only after review and approval)")
+                             "migration overwrite what it defines and record the deviations. Requires separate administrative "
+                             "approval for each use; never on Neon staging or production without explicit authorization")
     args = parser.parse_args()
     if args.status and args.apply:
         parser.error("--status is read-only; it cannot be combined with --apply")

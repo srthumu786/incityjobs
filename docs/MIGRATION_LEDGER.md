@@ -141,6 +141,15 @@ its dry run for databases without a ledger) or remove the tool. That needs a sep
   ledger and record version 1 as `baselined` (no migration SQL runs). A partly migrated, weakened,
   altered or duplicate-blocked schema is refused and nothing is created.
 
+## Override options: separate administrative approval required
+
+`--accept-drift` and `--repair-version1-drift` override safety refusals (exit 7). Each requires
+**separate administrative approval for each use**, given after the listed differences have been
+reviewed. They must **not** be used on the Neon staging branch or on production without explicit
+written authorization naming that database and the differences being accepted or repaired.
+Approval to run migrations is not approval to use these options. So far they have only been run
+against throwaway test databases in `tests/test_migration_ledger.py`.
+
 ## Exact version-1 definitions (`db_migrations.VERSION1_*`)
 
 These are **checks of the existing version-1 schema only**: exactly what `BASE_SCHEMA_SQL` and

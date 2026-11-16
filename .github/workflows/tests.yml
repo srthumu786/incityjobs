@@ -14,7 +14,7 @@ name: Tests
 
 on:
   push:
-    branches: ["main", "fix/**", "p0/**"]
+    branches: ["main", "fix/**", "p0/**", "b01/**"]
   pull_request:
     branches: ["main", "fix/**"]
   workflow_dispatch:
