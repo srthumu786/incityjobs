@@ -1,6 +1,6 @@
 # InCityJobs test suites on a throwaway local PostgreSQL.
 #
-# Runs `bash tests/run_local.sh` (all eight suites) on a GitHub-hosted Ubuntu runner.
+# Runs `bash tests/run_local.sh` (all nine suites) on a GitHub-hosted Ubuntu runner.
 # - No deployment, no merge, no Neon or production access: the tests create their own
 #   PostgreSQL cluster on a Unix socket (no TCP) and delete it afterwards; the Neon API is a
 #   local stand-in (tests/fake_neon_api.py).
@@ -32,7 +32,7 @@ defaults:
 
 jobs:
   tests:
-    name: All eight test suites
+    name: All nine test suites
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -77,7 +77,7 @@ jobs:
       - name: Self-test the results reporter (no database)
         run: python3 tests/test_ci_summary.py
 
-      - name: Run all eight suites (throwaway PostgreSQL, Unix socket only)
+      - name: Run all nine suites (throwaway PostgreSQL, Unix socket only)
         run: |
           set -o pipefail
           bash tests/run_local.sh 2>&1 | tee "$RUNNER_TEMP/test-output.txt"

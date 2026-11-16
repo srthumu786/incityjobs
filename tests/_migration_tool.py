@@ -1,5 +1,6 @@
-"""Run scripts/check_migration.py in a subprocess with the test-only Neon API stand-in
-(tests/fake_neon_api.py). Shared by test_migration.py and test_migration_partial.py."""
+"""Run scripts/check_migration.py (or scripts/migrate.py) in a subprocess with the test-only Neon
+API stand-in (tests/fake_neon_api.py). Shared by test_migration.py, test_migration_partial.py and
+test_migration_ledger.py."""
 import copy
 import json
 import os
@@ -63,7 +64,8 @@ def good_url(sslmode="verify-full"):
     return f"postgresql://{user}:{pw}@{STAGING_EP}-pooler.c-2.us-east-2.aws.neon.tech/neondb{query}"
 
 
-def run(db, *args, url=None, scen=None, key=API_KEY, guard=True, break_probe=False, env_extra=None):
+def run(db, *args, url=None, scen=None, key=API_KEY, guard=True, break_probe=False, env_extra=None,
+        script="check_migration.py"):
     """Returns (exit code, output, log lines). log lines show 'api <path>' and 'db connect ...'."""
     url = url or good_url()
     tmp = tempfile.mkdtemp(dir=os.environ["PGSHIM_HOST"])
@@ -80,7 +82,7 @@ def run(db, *args, url=None, scen=None, key=API_KEY, guard=True, break_probe=Fal
     env.update(env_extra or {})
     argv = (default_args(db) if guard else []) + list(args)
     code = ("import sys, runpy, fake_neon_api; "
-            f"sys.argv = ['check_migration.py'] + {argv!r}; "
-            f"runpy.run_path({os.path.join(REPO, 'scripts', 'check_migration.py')!r}, run_name='__main__')")
+            f"sys.argv = [{script!r}] + {argv!r}; "
+            f"runpy.run_path({os.path.join(REPO, 'scripts', script)!r}, run_name='__main__')")
     p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=TESTS)
     return p.returncode, p.stdout + p.stderr, open(log_file).read().splitlines()

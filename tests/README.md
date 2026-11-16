@@ -1,6 +1,6 @@
 # InCityJobs test suites
 
-Eight suites, run together with one command against a **throwaway local PostgreSQL**
+Nine suites, run together with one command against a **throwaway local PostgreSQL**
 cluster. They never connect to Neon or any network database.
 
 | Suite | What it covers |
@@ -12,6 +12,7 @@ cluster. They never connect to Neon or any network database.
 | `test_recommendations.py` | Employer Recommended Candidates: opt-in consent (default off, revocable, audited), append-only audit, generation on every trigger, status rules, read-time eligibility guard, anonymization against direct and indirect identifiers, ledger privacy, 10-worker concurrency with consent withdrawals, employer isolation (cross-employer, forged clicks, forged session state, forged tokens, unverified employers), immediate effect of consent withdrawal and verification revocation, 20-per-job cap, no repeated notifications. |
 | `test_db_roles.py` | Least-privilege roles (`scripts/apply_db_roles.py`, `scripts/db_roles_grants.sql`) on a Neon-like setup (non-superuser `neondb_owner` owns everything): production-endpoint guard, plan mode, exact privilege matrix and drift detection, idempotent apply, allowed and refused statements for `icj_app` and `icj_readonly`, the app's read-only startup check under `icj_app` (no DDL sent, schema unchanged), the main workflows under `icj_app`, and rollback leaving every row unchanged. |
 | `test_startup_readonly.py` | The app checks the schema and never migrates it (`db_schema.check_schema`, `app.verify_schema`). Evidence combined in every phase: a PostgreSQL READ ONLY transaction around the check, before/after schema fingerprints (`scripts/schema_fingerprint.sql`), the server log with `log_statement = 'ddl'` (records DDL even when rolled back; proved by a positive control), the adapter's statement log, and runs as both the table owner and least-privilege `icj_app`. Covers: static checks of `app.py`; `REQUIRED_SCHEMA` in step with the migration; legacy and partly migrated schemas refused with ICJ-ERR-511 and nothing written; nine weakened schemas refused (consent column missing, consent default TRUE or nullable, audit triggers disabled or replica-only, audit function not rejecting, match-ledger index, recommendation CHECK and UNIQUE missing); recovery after the administrator migration; full workflows; duplicate emails (runs degraded with ICJ-ERR-518, never creates the index itself); DDL or writes injected into the check refused with SQLSTATE 25006. Needs `INCITY_TEST_SERVER_LOG` (set by `run_local.sh`). |
+| `test_migration_ledger.py` | Migration version ledger and guarded runner (`db_migrations.py`, `scripts/migrate.py`, `migrations/`): code rules (duplicate, badly named, empty, unsafe and missing migrations; pinned baseline checksum); status, dry run and apply on a legacy database; ledger metadata; append-only ledger and one success per version; later SQL migrations; MODIFIED, MISSING, OUT OF ORDER and DUPLICATE detected with nothing run; all-or-nothing failure with a recorded `success = false` attempt; a migration that breaks the app schema or an unproven uniqueness probe is rolled back; advisory lock (held lock, two concurrent runners); baselining an already-migrated database only after verifying its structure (refused when partly migrated, weakened or blocked by duplicates); target guards; redacted output; post-commit re-verification; the app never runs any of it. |
 | `test_migration_partial.py` | Completing a partly migrated database (staging's Nov 13 state: Nov 8 schema, no c20a682 objects), starting from `fixtures/pre_c20a682_partial_schema.sql` with records in every table plus two unrelated tables. `scripts/check_migration.py` dry run changes nothing; `--apply` adds only the c20a682 columns, tables, indexes and triggers, keeps every existing row byte-identical, gives existing candidates no consent; second run changes nothing; a duplicate email blocks completion with rows intact; `scripts/schema_status.sql` is read-only. | Target verification (host format, sslmode, endpoint ids, and Neon's API confirming the branch name and that it is not the default/primary branch, via the stand-in `fake_neon_api.py`) refuses every wrong target before any database contact; `--apply` is all-or-nothing (a duplicate or an unproven probe commits nothing); the database connection must be `sslmode=verify-full` with a trusted CA bundle; shareable output is redacted; a failed post-commit re-verification exits 3. |
 ## Run them
 
@@ -35,7 +36,7 @@ bash tests/run_local.sh
 
 The runner:
 1. creates a new cluster in `/tmp/incity-pg.XXXXXX`, listening **only on a Unix socket** (no TCP), UTF-8 like Neon, with SCRAM password authentication and a random per-run password;
-2. runs `test_units.py`, `test_migration.py`, `test_e2e.py`, `test_diagnostics.py`, `test_recommendations.py`, `test_db_roles.py`, `test_migration_partial.py`, `test_startup_readonly.py` (set `INCITY_SUITES` to run a subset);
+2. runs `test_units.py`, `test_migration.py`, `test_e2e.py`, `test_diagnostics.py`, `test_recommendations.py`, `test_db_roles.py`, `test_migration_partial.py`, `test_startup_readonly.py`, `test_migration_ledger.py` (set `INCITY_SUITES` to run a subset);
 3. stops the cluster and deletes the directory, even if a test fails.
 
 Expected last lines:
@@ -49,6 +50,7 @@ recommendation tests: 59/59 passed (...)
 db role tests: 69/69 passed (...)
 partial-migration tests: 90/90 passed (...)
 startup read-only tests: 36/36 passed (...)
+migration ledger tests: 64/64 passed (...)
 ALL SUITES PASSED
 ```
 
@@ -88,13 +90,13 @@ It uses no repository secrets, no environments and no Neon access; the token is 
 pinned to a full commit SHA. `tests/ci_summary.py` writes a per-suite pass/fail table to the run's
 summary page and marks each problem as an error annotation.
 
-The reporter accepts a run only if all eight suites appear once, in order, each with exactly the
-expected number of checks (41, 34, 72, 33, 59, 69, 90, 36; 434 in all), all passed, with matching group
+The reporter accepts a run only if all nine suites appear once, in order, each with exactly the
+expected number of checks (41, 34, 72, 33, 59, 69, 90, 36, 64; 498 in all), all passed, with matching group
 counts and `PASS` lines, no `FAIL` line, and `ALL SUITES PASSED` as the last line. Zero checks, a
 missing or extra suite, truncated output and any failure are rejected. **When a suite gains or loses
 checks on purpose, update `EXPECTED` in `tests/ci_summary.py` in the same commit.**
 
-`tests/test_ci_summary.py` (52 checks, no database) tests the reporter on successful, incomplete,
+`tests/test_ci_summary.py` (53 checks, no database) tests the reporter on successful, incomplete,
 truncated and failed output; the workflow runs it before the suites:
 
 ```
