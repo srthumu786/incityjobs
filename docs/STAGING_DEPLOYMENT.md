@@ -102,7 +102,8 @@ twice is refused (the probe is rolled back; it only advances the id sequences).
 > **Migration ledger (B01-T1, after review and approval):** `scripts/migrate.py` replaces this step
 > for ledgered databases. It runs the same guards and records every migration in
 > `schema_migration_ledger`. An already-migrated branch such as `staging-test-gate` is recorded with
-> `--baseline` (it verifies the schema first; no migration SQL runs). See `docs/MIGRATION_LEDGER.md`.
+> `--baseline` (it verifies the schema first; no migration SQL runs). Once a database has a ledger,
+> `check_migration.py` refuses it (exit 2) and `migrate.py` must be used. See `docs/MIGRATION_LEDGER.md`.
 
 ## 4. Create a manager account
 

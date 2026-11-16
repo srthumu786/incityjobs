@@ -72,9 +72,9 @@ E2E = "end-to-end tests: 72/72 passed (security 72/72)"
 # --- successful output
 ok, problems = verdict(good_run())
 c.ok("success", ok and not problems, "a complete run with the expected totals is accepted", debug=lambda: problems)
-c.ok("success", ci_summary.EXPECTED_TOTAL == 534, "expected totals add up to 534 (398 + 36 startup read-only + 100 migration ledger checks)")
-c.ok("success", [n for _, _, n in ci_summary.EXPECTED] == [41, 34, 72, 33, 59, 69, 90, 36, 100],
-     "expected per-suite totals are 41, 34, 72, 33, 59, 69, 90, 36, 100 in run order")
+c.ok("success", ci_summary.EXPECTED_TOTAL == 557, "expected totals add up to 557 (398 + 36 startup read-only + 123 migration ledger checks)")
+c.ok("success", [n for _, _, n in ci_summary.EXPECTED] == [41, 34, 72, 33, 59, 69, 90, 36, 123],
+     "expected per-suite totals are 41, 34, 72, 33, 59, 69, 90, 36, 123 in run order")
 ok, problems = verdict(good_run(noise=True) + ["", "  "])
 c.ok("success", ok, "debug lines, stderr tails and trailing blank lines don't affect a good run", debug=lambda: problems)
 ok, problems = verdict(good_run(**{"test_units.py": {"groups": "security 26/26, processing 9/9, data 3/3, matching 3/3"}}))
@@ -175,9 +175,9 @@ with tempfile.TemporaryDirectory() as tmp:
 
     r = run_reporter(good_run(), summary_file)
     summary = open(summary_file, encoding="utf-8").read()
-    c.ok("cli", r.returncode == 0 and "All nine suites passed: 534/534 checks." in summary
+    c.ok("cli", r.returncode == 0 and "All nine suites passed: 557/557 checks." in summary
          and summary.count("✅ passed") == 9 and "::error" not in r.stdout,
-         "good run: exit 0, 534/534 in the summary, nine passed rows, no error annotations",
+         "good run: exit 0, 557/557 in the summary, nine passed rows, no error annotations",
          debug=lambda: (r.returncode, r.stdout, summary))
     r = run_reporter(good_run(**{"test_units.py": {"total": 0}}), summary_file)
     summary = open(summary_file, encoding="utf-8").read()

@@ -15,3 +15,8 @@ The app never migrates (it runs a read-only schema check on start-up).
   mistakes with a new migration.
 - If a change needs `db_schema.REQUIRED_SCHEMA` (what the app checks on start-up) to change,
   update it in the same commit.
+- Before the first file here is applied anywhere: add its expected resulting schema
+  (`VERSION_CHANGES[N]` in `db_migrations.py`) and the tests that check it. See "How future
+  migrations define and verify their expected schema" in `docs/MIGRATION_LEDGER.md`.
+- For now, write function bodies on one line: the safety check refuses lines that begin with
+  `BEGIN` or `END`.

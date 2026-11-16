@@ -10,7 +10,7 @@ review. Not pushed, merged or deployed; no Neon database contacted; no credentia
 | `db_migrations.py` | Migration definitions and rules, ledger table, advisory lock, schema verification. No Streamlit. Never imported by the app. |
 | `migrations/` | Future migrations, `NNNN_short_name.sql`, one transaction-safe script each (rules in `migrations/README.md`). Empty today. |
 | `scripts/migrate.py` | The administrator command. Same target guards and TLS as `scripts/check_migration.py` (it reuses them). |
-| `tests/test_migration_ledger.py` | 100 checks, the ninth suite. |
+| `tests/test_migration_ledger.py` | 123 checks, the ninth suite. |
 
 **Version 1 (`baseline_schema`)** is the schema `db_schema.apply_schema()` creates. Its checksum
 (SHA-256 of `BASE_SCHEMA_SQL` plus the UNIQUE email index definitions) is pinned in
@@ -25,6 +25,20 @@ role), `runner`, `git_commit` (of the checkout that ran it), `database_name`, `d
 verification summary and probe result, or for a failure only the error type and SQLSTATE; never
 row data). A partial UNIQUE index allows one successful row per version. Triggers reject UPDATE,
 DELETE and TRUNCATE (append-only, like `privacy_audit_log`). The app does not read it.
+
+**Each successful row records a schema snapshot** (`detail.schema_snapshot`: SHA-256 and
+the object list). The snapshot holds the sorted, normalized definitions of every table, column
+(type, NOT NULL, default), constraint (definition, VALID), index, trigger (definition, enabled)
+and function (signature, language, return type, SECURITY DEFINER, SHA-256 of the body) in the
+schema, except the ledger's own objects. Catalog only, no row data.
+
+**Drift detection.** `--status`, `--apply` and the post-commit re-verification compare the live
+catalog with the newest recorded snapshot. Any difference is **SCHEMA DRIFT (exit 7)**, listed
+object by object, whichever version the database is at. With drift, `--apply` runs nothing,
+unless `--accept-drift` is given after review and approval; then the pending migrations run and
+the accepted differences are recorded in their ledger rows. Reverting the change by hand clears
+the drift. (Tested with a simulated version 2: a hand-restored v1 function, a changed default,
+a dropped or disabled audit trigger, and an added index or column are all detected.)
 
 **Times come from the database's clock, never the administrator's computer.** Each migration's
 start and finish are read with `clock_timestamp()` on the database server, and the duration is
@@ -73,38 +87,36 @@ runner exits 4 at once instead of waiting. Transaction-scoped, so it is released
 rollback and also works through Neon's transaction-mode pooler. (Advisory locks are per
 database.) `lock_timeout` 10 s and `statement_timeout` 120 s still apply to everything else.
 
-**Fence against the older tool.** The advisory lock only stops other `migrate.py` runs. To stop
-`scripts/check_migration.py` (which takes no advisory lock) from changing the schema at the same
-time, `migrate.py` also takes `LOCK TABLE beta_employers IN SHARE UPDATE EXCLUSIVE MODE` (3 s
-wait) in the same transaction. That mode doesn't conflict with the app's reads and writes, but it
-does conflict with any DDL on the table, and the old tool's migration always starts with
+**The older tool on ledgered databases (correction of Nov 16).** `scripts/check_migration.py` is
+now only for databases WITHOUT a ledger. Inside its single transaction it:
+
+1. takes the same advisory lock first, never waiting: exit 4 if `migrate.py` holds it;
+2. only then checks for `schema_migration_ledger`: exit 2 if it exists, for both the dry run and
+   `--apply`. The message points to `migrate.py`;
+3. only then runs its migration, exactly as before.
+
+The order makes the check safe. `migrate.py` creates the ledger only while holding the lock, in
+its main transaction, in a baseline, or when recording a failure. So a ledger is either already
+committed, and the old tool sees it once it has the lock, or it is being created under the lock
+and the old tool is refused by the lock. There is no moment between the check and the old tool's
+schema changes in which a ledger can appear. Tested: a ledger created but not yet committed under
+the lock (exit 4), then committed (exit 2), with nothing changed either time. On a database without
+a ledger the old tool works exactly as before (tested).
+
+**Fence, for older copies of the tool.** A copy of `check_migration.py` from before this
+correction takes no advisory lock. `migrate.py` therefore also takes `LOCK TABLE beta_employers
+IN SHARE UPDATE EXCLUSIVE MODE` (3 s wait). That mode doesn't block the app's reads and writes,
+but it conflicts with any DDL on the table, and every version of the old tool starts with
 `ALTER TABLE beta_employers`. So:
 
-- old tool already running: `migrate.py` can't take the fence and exits 4, having done nothing;
-- `migrate.py` running: the old tool's first ALTER waits (up to its 10 s `lock_timeout`) until
-  `migrate.py` commits or rolls back. Then it either runs on the finished schema or, if it
-  waited too long, rolls back all-or-nothing.
+- an old copy that is already running makes `migrate.py` exit 4;
+- an old copy started while `migrate.py` runs waits for it to finish.
 
-The two never change the schema concurrently. Both cases are tested, including a real
-`check_migration.py --apply` started while `migrate.py` holds the fence.
+An old copy run AFTERWARDS on a ledgered database is not prevented. Its changes are caught by the
+drift check below.
 
-## Proposal for the older tool (not implemented; needs approval)
-
-The safest path keeps `check_migration.py` usable for its reviewed purpose while making it unable
-to diverge from the ledger:
-
-1. **Now (no change to the old tool):** the fence above, plus a documented rule that
-   `migrate.py` is the tool for every ledgered database.
-2. **Next (small change, after review):** `check_migration.py --apply` takes the same advisory
-   lock (`pg_try_advisory_xact_lock(db_migrations.LOCK_KEY)`, exit 4 if held), and refuses
-   (exit 2) when `schema_migration_ledger` exists, pointing to `migrate.py`. Its dry run stays
-   available as a read-only second opinion.
-3. **Later:** once staging and production are ledgered, retire `--apply` from
-   `check_migration.py` (keep the dry run), or remove the tool, and update
-   `docs/STAGING_DEPLOYMENT.md`.
-
-Not recommended: deleting the old tool now (its dry run is the reviewed path for the Nov 14
-staging state), or having it write ledger rows (two writers of one audit record).
+**Still open:** once staging and production are ledgered, retire the old tool's `--apply` (keep
+its dry run for databases without a ledger) or remove the tool. That needs a separate approval.
 
 ## Behaviour
 
@@ -117,6 +129,13 @@ staging state), or having it write ledger rows (two writers of one audit record)
   the attempt. After a commit, a read-only re-verification (exit 3 if it fails).
 - **No ledger but a complete schema** (staging-test-gate's state): `--apply` refuses to re-run
   the baseline and says to use `--baseline`.
+- **No ledger and existing objects that DIFFER from version 1** (as opposed to objects that are
+  simply missing): the dry run and `--apply` list every deviation first, then refuse with
+  **exit 7**. Nothing is repaired silently. `--repair-version1-drift`, given after review, lets
+  version 1 overwrite what it defines (functions, triggers, indexes) and records the repaired
+  deviations. Deviations version 1 cannot fix, such as a changed column default, still fail the
+  verification, and everything rolls back. A database with only missing objects (legacy, or the
+  Nov 13 partial state) migrates as before.
 - **`--baseline [--apply]`**: only for a database with no successful ledger rows. Verifies the
   actual structure first, strictly (next section). Only if everything matches does it create the
   ledger and record version 1 as `baselined` (no migration SQL runs). A partly migrated, weakened,
@@ -162,7 +181,42 @@ migration and data clean-up first:
 
 Exit codes: 0 done, 1 not complete (nothing committed), 2 refused by target guards, 3 committed
 but re-verification failed, 4 lock or fence held by another runner or tool, 5 integrity
-problem, 6 insufficient privilege.
+problem, 6 insufficient privilege, 7 schema drift or deviation (explicit action required).
+
+## How future migrations define and verify their expected schema
+
+Version 1's expected result is `VERSION1_*`. Every later version must declare its own expected
+result **before it is applied anywhere**. The rule:
+
+1. **Migration file:** `migrations/NNNN_name.sql`, transaction-safe. For now, a function body
+   must be written on one line: the file safety check refuses any line that begins with `BEGIN`
+   or `END`, indented or not.
+2. **Expected result:** a `VERSION_CHANGES[N]` entry in `db_migrations.py`, in the same
+   normalized forms as `VERSION1_*`, listing what version N adds, changes and removes:
+   - columns: type, NOT NULL, default;
+   - constraints: table, kind, definition, VALID;
+   - indexes: definition;
+   - triggers: definition including timing, events, level, WHEN and function, plus the enabled
+     state;
+   - functions: signature, language, return type, SECURITY DEFINER, and the whitespace-normalized
+     body.
+
+   The expected schema after version N is `VERSION1_*` with changes 2..N applied in order. A
+   version that redefines a version-1 object, such as the audit function, lists it as changed.
+3. **Verification before commit:** after the pending migrations run, the runner compares the live
+   catalog with that expected schema exactly, as it already does for version 1. Any mismatch rolls
+   everything back.
+4. **Recorded after commit:** the catalog snapshot in the ledger row. From then on, drift
+   detection compares against it.
+5. **Tests in the same commit:** migrating an empty database, a legacy copy and the current
+   staging-shaped state through version N must each produce exactly the expected schema; the
+   startup suite's `REQUIRED_SCHEMA` sync step migrates through version N; and the app's
+   `REQUIRED_*` are updated if the app depends on the change.
+
+Steps 2, 3 and 5 are **not implemented yet**, because no version 2 exists. They are a
+precondition for adding the first `migrations/0002_*.sql`. Until then, a later version is
+verified only against `REQUIRED_*` before commit and protected by the recorded snapshot
+afterwards.
 
 ## Proposed use on staging (each step needs its own authorization; NOT done)
 
@@ -192,19 +246,21 @@ it needs no schema change:
 
 ## Known limitations (after the Nov 16 corrections)
 
-- **The fence relies on the old tool's first statement.** It works because the old tool's migration
-  always starts by altering `beta_employers`. On an empty database (no `beta_employers` yet)
-  there is no fence; two tools creating the same tables at once would collide, and one would roll
-  back.
+- **Older copies of the old tool (from before this correction)** take no shared lock and don't
+  check for the ledger. They are held off only by the fence while `migrate.py` runs, and only when
+  `beta_employers` exists. Run afterwards, they can still change a ledgered database. That is
+  caught as drift (exit 7) but not prevented. Use only the current tool.
+- **Snapshots start with this code.** Ledger rows written before this correction have none, so
+  for them drift detection reports "none recorded yet" until the next migration or baseline.
 - **Any role can take the advisory lock.** That includes `icj_app`: it blocks migrations (exit 4)
   but cannot damage anything.
 - **The file safety check is a pattern.** It would wrongly refuse a PL/pgSQL function body
   containing lines that start with `BEGIN` or `END`, and cannot see statements built dynamically
   inside `DO` blocks.
 - **Checksums are byte-exact.** Line-ending conversion (CRLF) shows up as MODIFIED.
-- **Strict version-1 checks stop at version 1.** There are no per-version definition snapshots
-  yet. When a version 2 exists, its expected catalog has to be added, and so does the startup
-  suite's `REQUIRED_SCHEMA` sync step.
+- **No exact expected schema for version 2 or later yet:** see "How future migrations define and
+  verify their expected schema". A version 2's result is currently checked only against
+  `REQUIRED_*` before commit, though after commit any change is caught as drift.
 - **The app's start-up check is less strict.** It doesn't see, for example, a `WHEN (false)`
   condition added to an audit trigger; the strict baseline check does.
 - **The ledger is not tamper-proof against the owner or a superuser,** who can drop or recreate it.

@@ -54,6 +54,16 @@ Exit codes:
     4  another migration runner holds the lock: nothing done
     5  ledger or code integrity problem (modified, missing, out-of-order, duplicate): nothing run
     6  insufficient privilege for the connecting role: nothing done
+    7  schema drift or deviation: the database differs from what the ledger last recorded, or (no
+       ledger yet) existing objects differ from version 1. Nothing done. Resolve it explicitly:
+       revert the change, or re-run with --accept-drift (ledgered; recorded with the next
+       migration) or --repair-version1-drift (no ledger; lets version 1 overwrite what it defines,
+       recorded) after the deviation has been reviewed and approved.
+
+Drift detection: after every successful migration or baseline the ledger row records a catalog
+snapshot of the schema (db_migrations.catalog_snapshot: tables, columns, constraints, indexes,
+triggers, functions). --status and --apply compare the live catalog with the newest snapshot;
+any difference is reported before anything runs.
 """
 import argparse
 import json
@@ -172,9 +182,17 @@ def main() -> int:
     parser.add_argument("--expect-database", default="neondb")
     parser.add_argument("--ca-file", required=True, help="trusted CA bundle (PEM) for PostgreSQL and the Neon API")
     parser.add_argument("--migrations-dir", default=dbm.MIGRATIONS_DIR, help="default: the repository's migrations/")
+    parser.add_argument("--accept-drift", action="store_true",
+                        help="ledgered database whose schema differs from the last recorded snapshot: run the pending "
+                             "migrations anyway and record the accepted differences (only after review and approval)")
+    parser.add_argument("--repair-version1-drift", action="store_true",
+                        help="database WITHOUT a ledger whose existing objects differ from version 1: let the version-1 "
+                             "migration overwrite what it defines and record the deviations (only after review and approval)")
     args = parser.parse_args()
     if args.status and args.apply:
         parser.error("--status is read-only; it cannot be combined with --apply")
+    if (args.accept_drift or args.repair_version1_drift) and (args.status or args.baseline):
+        parser.error("--accept-drift / --repair-version1-drift apply only to a dry run or --apply of pending migrations")
     api_key = os.environ.get("NEON_API_KEY")
     say = guard.Output((guard.db_password(args.db_url), api_key))
 
@@ -231,6 +249,7 @@ def run(conn, args, code, say, sha, dirty):
                 preflight(cur, args, say, "status")
                 exists, rows, pending, problems = read_state(cur, code)
                 verification = dbm.schema_verification(cur, strict_version1=strict_for(code, rows))
+                drift_lines, has_snapshot = dbm.drift(cur) if exists and not problems else ([], False)
         except psycopg2.Error as exc:
             if getattr(exc, "pgcode", None) == "42501":
                 return privilege_exit(conn, exc, say)
@@ -244,6 +263,18 @@ def run(conn, args, code, say, sha, dirty):
                 say(f"   ledger problem: {p}")
             say("\nSTATUS: INTEGRITY PROBLEM. Nothing may run until it is resolved.")
             return 5
+        if exists:
+            say("Recorded schema snapshot: " + ("matches the live schema" if has_snapshot and not drift_lines else
+                                                "DIFFERS from the live schema" if drift_lines else "none recorded yet"))
+        if drift_lines:
+            for line in drift_lines:
+                say(f"   drift: {line}")
+            say("\nSTATUS: SCHEMA DRIFT: the schema was changed outside the migration runner since the last recorded "
+                "migration. Nothing may run until it is resolved (revert it, or --accept-drift after approval).")
+            return 7
+        if verification["deviations"]:
+            say("\nSTATUS: SCHEMA DEVIATION from version 1: existing objects differ (listed above).")
+            return 7
         if not exists:
             say("\nSTATUS: no ledger. " + ("The schema is complete: record it with --baseline (dry run first)."
                                           if verification["ok"] else "The schema is not complete: run the migrations (dry run first)."))
@@ -272,14 +303,40 @@ def run(conn, args, code, say, sha, dirty):
             if args.baseline:
                 return baseline(conn, cur, args, code, rows, exists, say, sha, dirty)
 
+            accepted, repaired = [], []
+            if rows:
+                drift_lines, _ = dbm.drift(cur)
+                if drift_lines:
+                    for line in drift_lines:
+                        say(f"   drift: {line}")
+                    if not args.accept_drift:
+                        conn.rollback()
+                        say("\nREFUSED: SCHEMA DRIFT. The schema differs from the snapshot recorded with the last migration "
+                            "(changed outside the migration runner). No migration was run; nothing was changed. Revert the "
+                            "change, or re-run with --accept-drift after the difference has been reviewed and approved.")
+                        return 7
+                    accepted = drift_lines
+                    say("Proceeding with --accept-drift: the differences above will be recorded with this migration.")
             if not rows:
-                verification = dbm.schema_verification(cur, strict_version1=True)
+                verification = dbm.schema_verification(cur, strict_version1=True)   # BEFORE anything runs
+                say_verification(say, verification)
                 if verification["ok"]:
                     conn.rollback()
-                    say_verification(say, verification)
                     say("\nREFUSED: this database has no ledger but its schema is already complete. Record it with "
                         "--baseline instead of re-running the baseline migration. Nothing was changed.")
                     return 1
+                if verification["deviations"]:
+                    for item in verification["deviations"]:
+                        say(f"   DEVIATION (exists but differs from version 1): {item}")
+                    if not args.repair_version1_drift:
+                        conn.rollback()
+                        say("\nREFUSED: existing objects differ from version 1 (listed above). They are not repaired "
+                            "silently. No migration was run; nothing was changed. Correct them by an approved change, or "
+                            "re-run with --repair-version1-drift after review to let version 1 overwrite what it defines.")
+                        return 7
+                    repaired = verification["deviations"]
+                    say("Proceeding with --repair-version1-drift: version 1 will overwrite what it defines; the "
+                        "deviations above will be recorded.")
             if not pending:
                 conn.rollback()
                 say("Nothing to do: every migration in the code is applied.")
@@ -306,11 +363,17 @@ def run(conn, args, code, say, sha, dirty):
             verification = dbm.schema_verification(cur, strict_version1=strict_for(code, rows + [(m.version,) for m in pending]))
             probe = guard.probe_in_transaction(conn) if applying else None
             proven = verification["ok"] and (not applying or (probe and all(v == "enforced" for v in probe.values())))
+            snapshot = dbm.snapshot_record(cur)
             for migration in pending:
-                dbm.record(cur, migration, "applied", True, *times[migration.version], sha,
-                           json.dumps({"verification": {k: verification[k] for k in ("ok", "checked", "strict_version1")},
-                                       "probe": probe, "uncommitted_changes_in_checkout": dirty,
-                                       "batch": [m.version for m in pending]}))
+                detail = {"verification": {k: verification[k] for k in ("ok", "checked", "strict_version1")},
+                          "probe": probe, "uncommitted_changes_in_checkout": dirty, "batch": [m.version for m in pending]}
+                if accepted:
+                    detail["accepted_drift"] = accepted
+                if repaired:
+                    detail["repaired_version1_deviations"] = repaired
+                if migration is pending[-1]:
+                    detail["schema_snapshot"] = snapshot
+                dbm.record(cur, migration, "applied", True, *times[migration.version], sha, json.dumps(detail))
             if report is not None:
                 guard.print_report(say, report, applying)
             say_verification(say, verification)
@@ -376,6 +439,7 @@ def baseline(conn, cur, args, code, rows, exists, say, sha, dirty):
                json.dumps({"verification": {k: verification[k] for k in ("ok", "checked", "strict_version1")},
                            "unique_email_active": verification["unique_email_active"],
                            "allowed_extras": verification["extras"],
+                           "schema_snapshot": dbm.snapshot_record(cur),
                            "uncommitted_changes_in_checkout": dirty,
                            "note": "existing schema verified and recorded; no migration SQL was run"}))
     later = [m.version for m in code[1:]]
@@ -420,11 +484,12 @@ def post_commit(conn, code):
             start(cur, read_only=True)
             exists, rows, pending, problems = read_state(cur, code)
             verification = dbm.schema_verification(cur, strict_version1=strict_for(code, rows))
+            drift_lines, _ = dbm.drift(cur) if exists and not problems else ([], False)
         conn.rollback()
     except psycopg2.Error as exc:
         conn.rollback()
         return [f"re-verification could not run: {guard.describe_error(exc)}"]
-    out = list(problems)
+    out = list(problems) + [f"drift: {d}" for d in drift_lines]
     if not exists:
         out.append("ledger missing")
     if pending:

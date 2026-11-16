@@ -37,12 +37,21 @@ Output is meant to be shareable: it passes through the same redaction as the app
 passwords, connection-string secrets, password hashes), duplicate emails are shown only as group
 numbers with row ids, and database errors are shown as type, SQLSTATE and a redacted message.
 
+Ledgered databases: this tool is only for databases WITHOUT a migration ledger. Inside its
+transaction it first takes the same transaction-scoped advisory lock as scripts/migrate.py
+(db_migrations.LOCK_KEY; never waits) and only then checks for schema_migration_ledger. migrate.py
+creates the ledger only while holding that lock, so no ledger can appear between the check and
+this tool's schema changes. If the lock is held: exit 4. If a ledger exists: exit 2, nothing
+changed (dry run included): use scripts/migrate.py, which records and verifies every migration.
+
 Exit codes:
     0  dry run: the migration would complete / apply: committed and re-verified
     1  not complete or an error before commit: nothing was committed
-    2  usage error, or refused by target verification (nothing was contacted)
+    2  usage error, refused by target verification (nothing was contacted), or the database has a
+       migration ledger (use scripts/migrate.py; nothing was changed)
     3  committed, but the read-only re-verification failed: the commit stands (cannot be undone
        automatically); restore from the backup branch or report the output
+    4  another migration runner (scripts/migrate.py) holds the migration lock: nothing was done
 """
 import argparse
 import json
@@ -58,6 +67,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import psycopg2  # noqa: E402
 import db_schema  # noqa: E402
+import db_migrations  # noqa: E402  (shared migration lock key and ledger name only)
 from diagnostics import redact  # noqa: E402  (the app's own log redaction; no Streamlit import)
 
 NEON_API = "https://console.neon.tech/api/v2"
@@ -320,6 +330,22 @@ def main() -> int:
         if database != args.expect_database:
             conn.rollback()
             say(f"Refused: connected to database {database!r}, expected {args.expect_database!r}. Nothing was changed.")
+            return 2
+        with conn.cursor() as cur:
+            # Lock FIRST, then look for the ledger: migrate.py creates the ledger only under this lock,
+            # so none can appear between this check and the schema changes below.
+            cur.execute("SELECT pg_try_advisory_xact_lock(%s);", (db_migrations.LOCK_KEY,))
+            locked = bool(cur.fetchone()[0])
+            ledgered = locked and db_migrations.ledger_exists(cur)
+        if not locked:
+            conn.rollback()
+            say("REFUSED: another migration runner (scripts/migrate.py) holds the migration lock. Nothing was changed.")
+            return 4
+        if ledgered:
+            conn.rollback()
+            say(f"REFUSED: this database has a migration ledger ({db_migrations.LEDGER_TABLE}). This tool is only for "
+                "databases without one; use scripts/migrate.py, which records and verifies every migration. "
+                "Nothing was changed.")
             return 2
         report = db_schema.apply_schema(conn, commit=False)          # same transaction; nothing committed yet
         if args.apply and report["complete"]:

@@ -23,6 +23,7 @@ MODIFIED); applied versions must be exactly 1..k (else OUT OF ORDER); a version 
 once (else DUPLICATE).
 """
 import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -442,6 +443,19 @@ def _norm(text, schema):
     return " ".join(str(text).replace(f"{schema}.", "").split())
 
 
+def _constraint_columns(table, kind, definition):
+    """The columns a version-1 constraint is on (as pg_constraint.conkey lists them)."""
+    if kind == "check":
+        return next(c for t, c in db_schema.REQUIRED_CHECK_CONSTRAINTS if t == table)
+    return ",".join(x.strip() for x in re.match(r"^(?:PRIMARY KEY|UNIQUE|FOREIGN KEY) \(([^)]*)\)", definition).group(1).split(","))
+
+
+def deviations(problems):
+    """The problems where an object EXISTS but differs from its definition (drift), as opposed to
+    objects that are simply missing (a database that is not, or only partly, migrated)."""
+    return [p for p in problems if not p.startswith("missing ")]
+
+
 def version1_definition_problems(cur):
     """(problems, extras): every version-1 column type / NOT NULL / default, primary key,
     foreign key (with its ON DELETE rule), UNIQUE and CHECK definition, index definition,
@@ -468,20 +482,27 @@ def version1_definition_problems(cur):
 
     cur.execute("""SELECT t.relname, CASE con.contype WHEN 'p' THEN 'primary key' WHEN 'f' THEN 'foreign key'
                                       WHEN 'u' THEN 'unique' ELSE 'check' END,
-                          pg_get_constraintdef(con.oid), con.conname, con.convalidated
+                          pg_get_constraintdef(con.oid), con.conname, con.convalidated,
+                          (SELECT string_agg(a.attname::text, ',' ORDER BY k.ord) FROM unnest(con.conkey) WITH ORDINALITY k(attnum, ord)
+                           JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum)
                    FROM pg_constraint con JOIN pg_class t ON t.oid = con.conrelid
                    JOIN pg_namespace n ON n.oid = t.relnamespace
                    WHERE n.nspname = current_schema() AND t.relname = ANY (string_to_array(%s, ',')) AND con.contype IN ('p', 'f', 'u', 'c');""",
                 (",".join(VERSION1_COLUMNS),))
-    have = {}
-    for table, kind, definition, name, validated in cur.fetchall():
+    have, by_columns = {}, {}
+    for table, kind, definition, name, validated, columns in cur.fetchall():
         definition = re.sub(r"\s+NOT VALID$", "", str(definition))   # reported through `validated` instead
         have[(table, kind, _norm(definition, schema))] = (name, validated)
+        by_columns.setdefault((table, kind, str(columns or "")), []).append(_norm(definition, schema))
     kinds = {"primary key": "primary key", "foreign key": "foreign key", "unique": "UNIQUE constraint", "check": "CHECK constraint"}
     for table, kind, definition in sorted(VERSION1_CONSTRAINTS):
         key = (table, kind, _norm(definition, schema))
         if key not in have:
-            problems.append(f"missing or different {kinds[kind]} on {table}: version 1 defines {definition}")
+            same_columns = by_columns.get((table, kind, _constraint_columns(table, kind, definition)))
+            if same_columns:   # present on the same columns, but defined differently: a deviation
+                problems.append(f"different {kinds[kind]} on {table}: found {same_columns[0]}; version 1 defines {definition}")
+            else:
+                problems.append(f"missing {kinds[kind]} on {table}: version 1 defines {definition}")
         elif not have[key][1]:
             problems.append(f"{kinds[kind]} {have[key][0]} on {table} is NOT VALID (not checked against existing rows)")
     expected_keys = {(t, k, _norm(d, schema)) for t, k, d in VERSION1_CONSTRAINTS}
@@ -542,6 +563,7 @@ def schema_verification(cur, strict_version1=False) -> dict:
         unique[index_name] = db_schema.verify_unique_index(cur, index_name, table, column)["active"]
     definition, extras = version1_definition_problems(cur) if strict_version1 else ([], [])
     return {"missing": missing, "unique_email_active": unique, "definition_problems": definition, "extras": extras,
+            "deviations": deviations(definition),
             "strict_version1": strict_version1,
             "ok": not missing and not definition and all(unique.values()),
             "checked": {"tables": len(db_schema.REQUIRED_SCHEMA),
@@ -552,3 +574,86 @@ def schema_verification(cur, strict_version1=False) -> dict:
                         "version1_definitions": (sum(len(c) for c in VERSION1_COLUMNS.values()) + len(VERSION1_CONSTRAINTS)
                                                  + len(VERSION1_INDEXES) + len(VERSION1_TRIGGERS) + len(VERSION1_FUNCTIONS))
                                                 if strict_version1 else 0}}
+
+
+# --------------------------------------------------------------------------- recorded schema snapshot (drift detection)
+LEDGER_OBJECTS = (LEDGER_TABLE, f"uq_{LEDGER_TABLE}_version_success", f"{LEDGER_TABLE}_append_only",
+                  f"{LEDGER_TABLE}_no_truncate", "incity_reject_ledger_change", f"{LEDGER_TABLE}_pkey",
+                  f"{LEDGER_TABLE}_id_seq")
+
+
+def catalog_snapshot(cur) -> list:
+    """Sorted, normalized definitions of every schema object in the current schema except the
+    ledger itself: tables, columns (type, NOT NULL, default), constraints (definition, VALID),
+    indexes (definition, usable), triggers (definition, enabled) and functions (signature,
+    language, return type, SECURITY DEFINER, SHA-256 of the body). Catalog only; no row data.
+    Recorded in the ledger after every successful migration or baseline; --status and --apply
+    compare the live catalog with the newest recorded snapshot, so ANY later change made outside
+    the runner (a reverted v2 function, a changed default, a dropped trigger) is reported as drift."""
+    schema = _schema(cur)
+    skip = ",".join(LEDGER_OBJECTS)
+    items = []
+    cur.execute("""SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid)
+                   FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+                   LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                   WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped
+                     AND NOT c.relname = ANY (string_to_array(%s, ','));""", (skip,))
+    for t, col, typ, nn, d in cur.fetchall():
+        items.append(f"column {t}.{col} {typ}{' NOT NULL' if nn else ''}{' DEFAULT ' + _norm(d, schema) if d is not None else ''}")
+    cur.execute("""SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'v', 'm')
+                     AND NOT c.relname = ANY (string_to_array(%s, ','));""", (skip,))
+    items += [f"table {r[0]}" for r in cur.fetchall()]
+    cur.execute("""SELECT t.relname, con.conname, pg_get_constraintdef(con.oid), con.convalidated
+                   FROM pg_constraint con JOIN pg_class t ON t.oid = con.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace
+                   WHERE n.nspname = current_schema() AND NOT t.relname = ANY (string_to_array(%s, ','));""", (skip,))
+    for t, name, d, valid in cur.fetchall():
+        definition = _norm(re.sub(r"\s+NOT VALID$", "", str(d)), schema)
+        items.append(f"constraint {t}.{name} {definition}{'' if valid else ' NOT VALID'}")
+    cur.execute("""SELECT c.relname, pg_get_indexdef(i.indexrelid), i.indisvalid AND i.indisready AND i.indislive
+                   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = current_schema() AND NOT c.relname = ANY (string_to_array(%s, ','));""", (skip,))
+    items += [f"index {name} {_norm(d, schema)}{'' if ok else ' NOT USABLE'}" for name, d, ok in cur.fetchall()]
+    cur.execute("""SELECT tg.tgname, pg_get_triggerdef(tg.oid), tg.tgenabled::text FROM pg_trigger tg
+                   JOIN pg_class c ON c.oid = tg.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = current_schema() AND NOT tg.tgisinternal AND NOT tg.tgname = ANY (string_to_array(%s, ','));""",
+                (skip,))
+    items += [f"trigger {name} {_norm(d, schema)} enabled={e}" for name, d, e in cur.fetchall()]
+    cur.execute("""SELECT p.proname, pg_get_function_identity_arguments(p.oid), l.lanname, format_type(p.prorettype, NULL),
+                          p.prosecdef, p.prosrc
+                   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_language l ON l.oid = p.prolang
+                   WHERE n.nspname = current_schema() AND p.prokind IN ('f', 'p')
+                     AND NOT p.proname = ANY (string_to_array(%s, ','));""", (skip,))
+    for name, args, lang, ret, secdef, body in cur.fetchall():
+        items.append(f"function {name}({args}) {lang} returns {ret}{' SECURITY DEFINER' if secdef else ''} "
+                     f"body sha256 {checksum(' '.join(str(body).split()))}")
+    return sorted(items)
+
+
+def snapshot_record(cur) -> dict:
+    items = catalog_snapshot(cur)
+    return {"sha256": checksum("\n".join(items)), "objects": items}
+
+
+def recorded_snapshot(cur):
+    """The newest successful ledger row's snapshot, or None (older rows have none)."""
+    cur.execute(f"""SELECT detail->'schema_snapshot' FROM {LEDGER_TABLE}
+                    WHERE success AND detail ? 'schema_snapshot' ORDER BY id DESC LIMIT 1;""")
+    row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    value = row[0]
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def drift(cur):
+    """(drift lines, recorded snapshot present). Lines read 'removed: ...' / 'added: ...'."""
+    recorded = recorded_snapshot(cur)
+    if recorded is None:
+        return [], False
+    now = catalog_snapshot(cur)
+    if checksum("\n".join(now)) == recorded.get("sha256"):
+        return [], True
+    before, after = set(recorded.get("objects", [])), set(now)
+    return ([f"removed or changed: {x}" for x in sorted(before - after)] +
+            [f"added or changed:   {x}" for x in sorted(after - before)]), True

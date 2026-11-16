@@ -496,15 +496,15 @@ c.ok("v1-spec", not any(t == "semantic_matches" and k == "foreign key" and "cand
      "the spec adds no constraint version 1 lacks (e.g. no FK on semantic_matches.candidate_profile_id, admin_email stays nullable)")
 DEVIATIONS = [
     ("foreign key dropped", "ALTER TABLE employer_jobs DROP CONSTRAINT employer_jobs_employer_id_fkey;",
-     "missing or different foreign key on employer_jobs"),
+     "missing foreign key on employer_jobs"),
     ("foreign key ON DELETE rule changed", "ALTER TABLE semantic_matches DROP CONSTRAINT semantic_matches_job_id_fkey; "
      "ALTER TABLE semantic_matches ADD CONSTRAINT semantic_matches_job_id_fkey FOREIGN KEY (job_id) REFERENCES employer_jobs(id) ON DELETE CASCADE;",
-     "missing or different foreign key on semantic_matches"),
+     "different foreign key on semantic_matches"),
     ("foreign key NOT VALID", "ALTER TABLE employer_recommendations DROP CONSTRAINT employer_recommendations_job_id_fkey; "
      "ALTER TABLE employer_recommendations ADD CONSTRAINT employer_recommendations_job_id_fkey FOREIGN KEY (job_id) "
      "REFERENCES employer_jobs(id) ON DELETE CASCADE NOT VALID;", "is NOT VALID"),
     ("primary key dropped", "ALTER TABLE system_telemetry_logs DROP CONSTRAINT system_telemetry_logs_pkey;",
-     "missing or different primary key on system_telemetry_logs"),
+     "missing primary key on system_telemetry_logs"),
     ("column type changed", "ALTER TABLE employer_jobs ALTER COLUMN match_radius_miles TYPE bigint;",
      "column employer_jobs.match_radius_miles: type is 'bigint'"),
     ("NOT NULL removed", "ALTER TABLE candidate_profiles ALTER COLUMN application_status DROP NOT NULL;",
@@ -514,7 +514,7 @@ DEVIATIONS = [
     ("CHECK definition widened", "ALTER TABLE employer_recommendations DROP CONSTRAINT employer_recommendations_status_check; "
      "ALTER TABLE employer_recommendations ADD CONSTRAINT employer_recommendations_status_check "
      "CHECK (status IN ('QUEUED', 'AVAILABLE', 'VIEWED', 'WITHDRAWN', 'DELIVERED'));",
-     "missing or different CHECK constraint on employer_recommendations"),
+     "different CHECK constraint on employer_recommendations"),
     ("index definition changed", "DROP INDEX idx_employer_recommendations_candidate; "
      "CREATE INDEX idx_employer_recommendations_candidate ON employer_recommendations (job_id);",
      "index idx_employer_recommendations_candidate is"),
@@ -582,21 +582,145 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         cur_.execute("INSERT INTO candidate_profiles (name, contact_email) VALUES ('Fence Test', 'fence@x.com');")
     conn_.commit(); conn_.close()
     app_seconds = time.monotonic() - t
+    t = time.monotonic()
+    old_code, old_out, _ = tool.run(FENCE, "--apply")            # the corrected scripts/check_migration.py
+    old_seconds = time.monotonic() - t
+    def old_version_ddl():                                        # what an OLDER copy of the tool does first
+        conn2 = psycopg2.connect(tool.good_url())
+        with conn2.cursor() as cur2:
+            cur2.execute("ALTER TABLE beta_employers ADD COLUMN IF NOT EXISTS password_hash TEXT;")
+        conn2.rollback(); conn2.close()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool2:
-        old_f = pool2.submit(tool.run, FENCE, "--apply")           # the real scripts/check_migration.py --apply
+        old_f = pool2.submit(old_version_ddl)
         waited = False
-        while not old_f.done() and not waited:                     # is its DDL waiting for migrate.py's fence?
+        while not old_f.done() and not waited:                     # is that DDL waiting for migrate.py's fence?
             waited = sql(FENCE, "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
                                 "AND wait_event_type = 'Lock' AND query LIKE '%ALTER TABLE beta_employers%';") != "0"
             time.sleep(0.05)
-        old_code, old_out, _ = old_f.result()
+        old_f.result()
     new_code, new_end, new_out = new_f.result()
-c.ok("fence", fence_seen and waited and new_code == 0 and old_code == 0,
-     "check_migration.py started while migrate.py held the fence: its DDL was seen waiting on the lock, then both "
-     "completed (serialized, never concurrent)", {"fence_seen": fence_seen, "waited": waited, "new": new_out[-300:], "old": old_out[-300:]})
+c.ok("fence", fence_seen and old_code == 4 and "holds the migration lock" in old_out and old_seconds < 30 and new_code == 0,
+     "corrected check_migration.py started while migrate.py runs: refused at once by the shared lock (exit 4)",
+     {"old": old_out[-300:], "new": new_out[-300:]})
+c.ok("fence", waited, "an older copy of the tool (no shared lock) is still held off by the fence: its first ALTER waits")
 c.ok("fence", fence_seen and app_seconds < 2, f"the fence does not block the app: an INSERT while it was held took {app_seconds:.2f} s")
 code_, out, log = migrate(FENCE, "--status", migrations=SLOW_FENCE)
 c.ok("fence", code_ == 0 and "up to date" in out, "after both runs: ledger and schema consistent (status up to date)", out)
+
+# ================================================================== 15. simulated version 2: the old tool can't overwrite it; drift is detected
+V2DB = "ledger_v2"
+legacy_db(V2DB)
+sql(V2DB, f"ALTER DATABASE {V2DB} SET log_statement = 'ddl';")
+migrate(V2DB, "--apply")
+V2_SQL = ("CREATE OR REPLACE FUNCTION incity_reject_audit_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+          "RAISE EXCEPTION 'privacy_audit_log is append-only (v2)' USING ERRCODE = 'insufficient_privilege'; END; $$;\n"
+          "CREATE TABLE ledger_v2_feature (id SERIAL PRIMARY KEY, note TEXT);\n")
+V2_DIR = mdir({"0002_audit_message_v2.sql": V2_SQL})
+V3_DIR = mdir({"0002_audit_message_v2.sql": V2_SQL, "0003_next.sql": "CREATE TABLE ledger_v3_feature (id int);\n"})
+def audit_body(db):
+    return sql(db, "SELECT prosrc FROM pg_proc WHERE proname = 'incity_reject_audit_change';")
+code_, out, log = migrate(V2DB, "--apply", migrations=V2_DIR)
+snap = sql(V2DB, f"SELECT detail->'schema_snapshot'->>'sha256' FROM {LEDGER} WHERE version = 2 AND success;")
+c.ok("v2", code_ == 0 and "(v2)" in audit_body(V2DB) and re.fullmatch(r"[0-9a-f]{64}", snap or ""),
+     "version 2 applied (changes the v1 audit function, adds a table); its ledger row records a schema snapshot", out)
+before, offset = (schema_fp(V2DB), ledger(V2DB)), os.path.getsize(SERVER_LOG)
+results = {mode: tool.run(V2DB, *mode)[:2] for mode in (("--apply",), ())}
+with open(SERVER_LOG, encoding="utf-8", errors="replace") as fh:
+    fh.seek(offset)
+    old_ddl = [l for l in fh if "statement:" in l]
+c.ok("v2", all(code == 2 and "has a migration ledger" in o and "use scripts/migrate.py" in o for code, o in results.values())
+     and "(v2)" in audit_body(V2DB) and (schema_fp(V2DB), ledger(V2DB)) == before and old_ddl == [],
+     "old tool --apply and dry run on the v2 database: refused (exit 2); v2's function kept; no DDL reached the server",
+     {k: v[1][-200:] for k, v in results.items()} | {"ddl": old_ddl})
+code_, out, log = migrate(V2DB, "--status", migrations=V2_DIR)
+c.ok("v2", code_ == 0 and "Recorded schema snapshot: matches the live schema" in out and "STATUS: up to date" in out,
+     "status after v2: up to date, live schema matches the recorded snapshot", out)
+sql(V2DB, db_schema.BASE_SCHEMA_SQL[db_schema.BASE_SCHEMA_SQL.index("CREATE OR REPLACE FUNCTION incity_reject_audit_change"):
+                                    db_schema.BASE_SCHEMA_SQL.index("CREATE OR REPLACE TRIGGER privacy_audit_log_append_only")])
+code_, out, log = migrate(V2DB, "--status", migrations=V2_DIR)
+c.ok("v2", code_ == 7 and "SCHEMA DRIFT" in out and "function incity_reject_audit_change" in out,
+     "the v1 function put back by hand (what an older tool would do): --status reports SCHEMA DRIFT (exit 7) naming it", out)
+before = (schema_fp(V2DB), ledger(V2DB))
+code_, out, log = migrate(V2DB, "--apply", migrations=V3_DIR)
+c.ok("v2", code_ == 7 and "REFUSED: SCHEMA DRIFT" in out and (schema_fp(V2DB), ledger(V2DB)) == before
+     and sql(V2DB, "SELECT to_regclass('ledger_v3_feature') IS NULL;") == "t",
+     "with drift, --apply of a pending v3 is refused (exit 7): nothing run or recorded", out)
+code_, out, log = migrate(V2DB, "--apply", "--accept-drift", migrations=V3_DIR)
+c.ok("v2", code_ == 0 and sql(V2DB, f"SELECT jsonb_array_length(detail->'accepted_drift') > 0 FROM {LEDGER} WHERE version = 3 AND success;") == "t",
+     "explicit --accept-drift: v3 runs and the accepted differences are recorded in its ledger row", out)
+code_, out, log = migrate(V2DB, "--status", migrations=V3_DIR)
+c.ok("v2", code_ == 0 and "matches the live schema" in out, "after the accepted run, the new snapshot matches (up to date)", out)
+sql(V2DB, "ALTER TABLE employer_jobs ALTER COLUMN match_radius_miles SET DEFAULT 50;")
+code_, out, log = migrate(V2DB, "--status", migrations=V3_DIR)
+c.ok("v2", code_ == 7 and "employer_jobs.match_radius_miles" in out,
+     "regression: a hand-made change to a v1 column after later versions is now detected (exit 7)", out)
+sql(V2DB, "ALTER TABLE employer_jobs ALTER COLUMN match_radius_miles SET DEFAULT 25;")
+code_, out, log = migrate(V2DB, "--status", migrations=V3_DIR)
+c.ok("v2", code_ == 0, "reverting the change by hand clears the drift (no record needed)", out)
+for change, label in (("DROP TRIGGER privacy_audit_log_no_truncate ON privacy_audit_log;", "audit trigger dropped"),
+                      ("ALTER TABLE privacy_audit_log DISABLE TRIGGER privacy_audit_log_append_only;", "audit trigger disabled"),
+                      ("CREATE INDEX ledger_v2_extra_idx ON ledger_v2_feature (note);", "index added outside the runner"),
+                      ("ALTER TABLE ledger_v2_feature ADD COLUMN sneaky TEXT;", "column added to a v2 table")):
+    name = "ledger_v2_drift"
+    legacy_db(name); migrate(name, "--apply"); migrate(name, "--apply", migrations=V2_DIR)
+    sql(name, change)
+    code_, out, log = migrate(name, "--status", migrations=V2_DIR)
+    c.ok("v2", code_ == 7 and "drift:" in out, f"drift detected after v2: {label}", out)
+
+# ================================================================== 16. the lock and the ledger check are coordinated
+COORD = "ledger_coord"
+legacy_db(COORD)
+os.environ["PGSHIM_DB"] = COORD
+runner = psycopg2.connect(tool.good_url())                         # a migrate.py run in progress, creating the ledger
+with runner.cursor() as cur:
+    cur.execute("SELECT pg_try_advisory_xact_lock(%s);", (dbm.LOCK_KEY,))
+    cur.execute(dbm.LEDGER_SQL)
+before = None
+code_, out, log = tool.run(COORD, "--apply")
+c.ok("coordination", code_ == 4 and "holds the migration lock" in out and sql(COORD, "SELECT to_regclass('employer_recommendations') IS NULL;") == "t",
+     "ledger being created under the lock (not yet committed): the old tool is refused by the lock (exit 4), changes nothing", out)
+runner.commit(); runner.close()
+code_, out, log = tool.run(COORD, "--apply")
+c.ok("coordination", code_ == 2 and "has a migration ledger" in out and sql(COORD, "SELECT to_regclass('employer_recommendations') IS NULL;") == "t",
+     "once that ledger is committed, the old tool sees it after taking the lock: refused (exit 2), changes nothing", out)
+CHECK_SRC = open(os.path.join(REPO, "scripts", "check_migration.py"), encoding="utf-8").read()
+c.ok("coordination", CHECK_SRC.index("pg_try_advisory_xact_lock") < CHECK_SRC.index("ledger_exists(cur)")
+     < CHECK_SRC.index("report = db_schema.apply_schema(conn, commit=False)"),
+     "check_migration.py: lock first, then the ledger check, then the schema changes (same transaction)")
+COMPAT = "ledger_compat"
+legacy_db(COMPAT)
+code_, out, log = tool.run(COMPAT, "--apply")
+c.ok("coordination", code_ == 0 and "MIGRATION COMPLETE" in out and ledger(COMPAT) is None,
+     "backward compatible: the old tool still migrates a database without a ledger (exit 0, no ledger created)", out)
+
+# ================================================================== 17. no silent repair of an unledgered database that deviates
+for label, change, repairable in (
+        ("audit trigger given WHEN (false)", "DROP TRIGGER privacy_audit_log_append_only ON privacy_audit_log; "
+         "CREATE TRIGGER privacy_audit_log_append_only BEFORE UPDATE OR DELETE ON privacy_audit_log FOR EACH ROW WHEN (false) "
+         "EXECUTE FUNCTION incity_reject_audit_change();", True),
+        ("column default changed", "ALTER TABLE employer_jobs ALTER COLUMN match_radius_miles SET DEFAULT 50;", False)):
+    name = "ledger_dev"
+    baseline_db(name, extra_sql=change + " ALTER TABLE candidate_profiles DROP COLUMN resume_version;")  # incomplete + deviating
+    before = schema_fp(name)
+    dry_code, dry_out, _ = migrate(name)
+    app_code, app_out, _ = migrate(name, "--apply")
+    c.ok("no-silent-repair", dry_code == 7 and app_code == 7 and "DEVIATION (exists but differs from version 1)" in dry_out
+         and dry_out.index("DEVIATION") < dry_out.index("REFUSED") and schema_fp(name) == before and ledger(name) is None,
+         f"{label}: dry run and --apply list the deviation first and refuse (exit 7); nothing changed or recorded", app_out)
+    code_, out, _ = migrate(name, "--apply", "--repair-version1-drift")
+    if repairable:
+        c.ok("no-silent-repair", code_ == 0 and "DEVIATION" in out and sql(name, f"SELECT jsonb_array_length(detail->'repaired_version1_deviations') "
+                                                                          f"FROM {LEDGER} WHERE success;") == "1"
+             and "WHEN" not in sql(name, "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'privacy_audit_log_append_only';"),
+             f"{label}: explicit --repair-version1-drift repairs it and records the repaired deviation", out)
+    else:
+        c.ok("no-silent-repair", code_ == 1 and "NOT APPLIED" in out and ledger(name, "success") in (None, "") and schema_fp(name) == before,
+             f"{label}: --repair-version1-drift can't fix it (version 1 doesn't redefine defaults): rolled back, nothing kept", out)
+name = "ledger_partial_compat"
+fresh_db(name); load_legacy_schema(name); sql(name, open(PARTIAL, encoding="utf-8").read())
+code_, out, _ = migrate(name, "--apply")
+c.ok("no-silent-repair", code_ == 0 and "DEVIATION" not in out and ledger(name) == "1:applied:true",
+     "backward compatible: a partly migrated database (only MISSING objects, no deviations) migrates as before", out)
 
 for d in [p for p in os.listdir(os.environ["PGSHIM_HOST"]) if p.startswith("migrations-")]:
     shutil.rmtree(os.path.join(os.environ["PGSHIM_HOST"], d), ignore_errors=True)
